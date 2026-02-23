@@ -155,3 +155,81 @@ class TranslationDebouncer:
     def shutdown(self):
         with self._lock:
             self._cancel_timer()
+
+
+# ---------------------------------------------------------------------------
+# Subtitle Overlay Window
+# ---------------------------------------------------------------------------
+
+class SubtitleOverlay:
+    """
+    Always-on-top 半透明字幕視窗，固定在指定螢幕底部。
+
+    使用方式：
+        overlay = SubtitleOverlay(screen_index=0)
+        overlay.set_text(en="Hello world", zh="你好世界")
+        overlay.run()  # 阻塞，在主執行緒呼叫
+    """
+
+    WINDOW_HEIGHT = 120
+    BG_COLOR = "#000000"
+    EN_COLOR = "#888888"
+    ZH_COLOR = "#ffffff"
+    EN_FONT = ("Arial", 14)
+    ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
+
+    def __init__(self, screen_index: int = 0):
+        monitors = get_monitors()
+        if screen_index >= len(monitors):
+            screen_index = 0
+        m = monitors[screen_index]
+        self._x = m.x
+        self._y = m.y + m.height - self.WINDOW_HEIGHT
+        self._width = m.width
+
+        self._root = tk.Tk()
+        self._root.overrideredirect(True)
+        self._root.wm_attributes("-topmost", True)
+        self._root.wm_attributes("-alpha", 0.85)
+        self._root.configure(bg=self.BG_COLOR)
+        self._root.geometry(
+            f"{self._width}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
+        )
+
+        # 英文行
+        self._en_var = tk.StringVar()
+        tk.Label(
+            self._root,
+            textvariable=self._en_var,
+            font=self.EN_FONT,
+            fg=self.EN_COLOR,
+            bg=self.BG_COLOR,
+            anchor="w",
+            padx=20,
+        ).pack(fill="x", pady=(10, 0))
+
+        # 中文行
+        self._zh_var = tk.StringVar()
+        tk.Label(
+            self._root,
+            textvariable=self._zh_var,
+            font=self.ZH_FONT,
+            fg=self.ZH_COLOR,
+            bg=self.BG_COLOR,
+            anchor="w",
+            padx=20,
+        ).pack(fill="x")
+
+        # Esc 鍵退出
+        self._root.bind("<Escape>", lambda e: self._root.destroy())
+
+    def set_text(self, en: str = "", zh: str = ""):
+        """從任意執行緒安全地更新字幕（用 after() 排程到主執行緒）。"""
+        def _update():
+            self._en_var.set(en[:120])
+            self._zh_var.set(zh[:60])
+        self._root.after(0, _update)
+
+    def run(self):
+        """啟動 tkinter mainloop（阻塞，必須在主執行緒呼叫）。"""
+        self._root.mainloop()
