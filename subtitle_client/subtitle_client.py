@@ -291,3 +291,117 @@ class AudioCapture:
         """印出可用的音訊輸入裝置，供使用者用 --device 指定。"""
         import sounddevice as sd
         print(sd.query_devices())
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Real-time subtitle overlay")
+    parser.add_argument(
+        "--asr-server",
+        default="http://localhost:8000",
+        help="Qwen3-ASR streaming server URL (e.g. http://192.168.1.100:8000)",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=os.environ.get("OPENAI_API_KEY", ""),
+        help="OpenAI API key (or set OPENAI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--screen",
+        type=int,
+        default=0,
+        help="Display screen index (0=primary, 1=secondary)",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="Audio input device index (run with --list-devices to see options)",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available audio devices and exit",
+    )
+    parser.add_argument(
+        "--translation-model",
+        default="gpt-4o-mini",
+        help="OpenAI model for translation",
+    )
+    args = parser.parse_args()
+
+    if args.list_devices:
+        AudioCapture.list_devices()
+        return
+
+    if not args.openai_api_key:
+        print("Error: --openai-api-key or OPENAI_API_KEY required")
+        return
+
+    # 初始化字幕視窗
+    overlay = SubtitleOverlay(screen_index=args.screen)
+
+    # 目前的 ASR 文字（跨執行緒共享）
+    current_en = ""
+
+    def on_translation(zh_text: str):
+        nonlocal current_en
+        overlay.set_text(en=current_en, zh=zh_text)
+
+    # 初始化翻譯 debouncer
+    debouncer = TranslationDebouncer(
+        api_key=args.openai_api_key,
+        callback=on_translation,
+        model=args.translation_model,
+    )
+
+    # 初始化 ASR client
+    asr = ASRClient(args.asr_server)
+
+    def run_asr():
+        nonlocal current_en
+        asr.start()
+        print(f"[ASR] Session started: {asr.session_id}")
+
+        def on_chunk(audio: np.ndarray):
+            nonlocal current_en
+            try:
+                result = asr.push_chunk(audio)
+                text = result.get("text", "")
+                if text != current_en:
+                    current_en = text
+                    overlay.set_text(en=text, zh="")
+                    debouncer.update(text)
+            except Exception as e:
+                print(f"[ASR error] {e}")
+
+        capture = AudioCapture(callback=on_chunk, device=args.device)
+        capture.start()
+        print("[Audio] Capturing... Press Esc to stop.")
+
+        try:
+            while overlay._root.winfo_exists():
+                time.sleep(0.1)
+        except Exception:
+            pass
+        finally:
+            capture.stop()
+            debouncer.shutdown()
+            try:
+                asr.finish()
+            except Exception:
+                pass
+            print("[ASR] Session finished.")
+
+    # ASR 在背景執行緒跑
+    asr_thread = threading.Thread(target=run_asr, daemon=True)
+    asr_thread.start()
+
+    # tkinter mainloop 在主執行緒（blocking）
+    overlay.run()
+
+
+if __name__ == "__main__":
+    main()
