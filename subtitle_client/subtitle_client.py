@@ -233,3 +233,61 @@ class SubtitleOverlay:
     def run(self):
         """啟動 tkinter mainloop（阻塞，必須在主執行緒呼叫）。"""
         self._root.mainloop()
+
+# ---------------------------------------------------------------------------
+# Audio Capture
+# ---------------------------------------------------------------------------
+
+TARGET_SR = 16000
+CHUNK_SAMPLES = 8000  # 0.5 秒 @ 16kHz
+
+
+class AudioCapture:
+    """
+    持續擷取麥克風音訊，每 0.5 秒呼叫一次 callback。
+
+    使用方式：
+        def on_chunk(audio: np.ndarray):
+            # audio: shape (8000,), dtype float32, 16kHz
+            pass
+
+        capture = AudioCapture(callback=on_chunk)
+        capture.start()
+        time.sleep(10)
+        capture.stop()
+    """
+
+    def __init__(self, callback: Callable[[np.ndarray], None], device=None):
+        self.callback = callback
+        self.device = device  # None = 系統預設麥克風
+        self._stream = None
+
+    def start(self):
+        import sounddevice as sd
+        self._stream = sd.InputStream(
+            samplerate=TARGET_SR,
+            channels=1,
+            dtype="float32",
+            blocksize=CHUNK_SAMPLES,
+            device=self.device,
+            callback=self._sd_callback,
+        )
+        self._stream.start()
+
+    def _sd_callback(self, indata: np.ndarray, frames, time_info, status):
+        if status:
+            print(f"[Audio] {status}")
+        chunk = indata[:, 0].copy()  # mono, shape (CHUNK_SAMPLES,)
+        self.callback(chunk)
+
+    def stop(self):
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+    @staticmethod
+    def list_devices():
+        """印出可用的音訊輸入裝置，供使用者用 --device 指定。"""
+        import sounddevice as sd
+        print(sd.query_devices())
