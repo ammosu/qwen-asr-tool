@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Real-time subtitle overlay for Windows.
+Real-time subtitle overlay（Linux/Windows）。
 
 Usage:
-    python subtitle_client.py --asr-server http://<LINUX_IP>:8000 --openai-api-key sk-...
+    python subtitle_client.py --asr-server http://<SERVER_IP>:8000 --openai-api-key sk-...
 
 Requirements:
-    pip install sounddevice numpy requests openai screeninfo
+    pip install sounddevice numpy scipy requests openai screeninfo
 """
+# 必須在所有 X11/tkinter/sounddevice import 之前呼叫，
+# 避免 PulseAudio PortAudio 後端的 XInitThreads() 與 tkinter 衝突。
+try:
+    import ctypes
+    ctypes.CDLL("libX11.so.6").XInitThreads()
+except Exception:
+    pass  # Windows 或找不到 libX11 時忽略
+
 import argparse
 import os
 import queue
