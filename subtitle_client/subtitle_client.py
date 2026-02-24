@@ -10,6 +10,7 @@ Requirements:
 """
 import argparse
 import os
+import queue
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -266,6 +267,9 @@ class MonitorAudioSource(AudioSource):
     """
     擷取 PipeWire/PulseAudio monitor source（系統播放音訊）。
 
+    使用 queue.Queue 解耦音訊 callback 與 ASR HTTP 請求，避免
+    阻塞操作污染即時音訊執行緒。
+
     device 預設：alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor
     """
 
@@ -274,45 +278,75 @@ class MonitorAudioSource(AudioSource):
     def __init__(self, device: str | None = None):
         self._device = device or self.DEFAULT_DEVICE
         self._stream = None
+        self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._native_sr: int = 0
+        self._callback: Callable[[np.ndarray], None] | None = None
+        self._queue: queue.Queue = queue.Queue()
+        self._running: bool = False
+        self._consumer_thread: threading.Thread | None = None
 
     def start(self, callback: Callable[[np.ndarray], None]) -> None:
+        if self._stream is not None:
+            raise RuntimeError("MonitorAudioSource is already running; call stop() first.")
+
         import sounddevice as sd
         dev_info = sd.query_devices(self._device, kind="input")
-        native_sr = int(dev_info["default_samplerate"])  # 通常 48000
-
+        self._native_sr = int(dev_info["default_samplerate"])  # 通常 48000
         self._callback = callback
-        self._native_sr = native_sr
         self._buf = np.zeros(0, dtype=np.float32)
+        self._running = True
 
+        # 消費者執行緒：從 queue 取音訊、resample、送 callback
+        self._consumer_thread = threading.Thread(target=self._consumer, daemon=True)
+        self._consumer_thread.start()
+
+        # 音訊 stream：callback 只做 enqueue（不阻塞）
         self._stream = sd.InputStream(
-            samplerate=native_sr,
+            samplerate=self._native_sr,
             channels=1,
             dtype="float32",
-            blocksize=0,                # 讓 sounddevice 決定
+            blocksize=int(self._native_sr * 0.05),  # 50ms 固定 buffer
             device=self._device,
             callback=self._sd_callback,
         )
         self._stream.start()
 
-    def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status):
+    def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        """音訊執行緒 callback：只做最輕量的 enqueue，不做任何阻塞操作。"""
         if status:
             print(f"[Audio] {status}")
-        mono = indata[:, 0]
-        # resample native_sr → 16000
-        target_len = int(len(mono) * TARGET_SR / self._native_sr)
-        resampled = signal.resample(mono, target_len).astype(np.float32)
-        self._buf = np.concatenate([self._buf, resampled])
-        # 每累積 CHUNK_SAMPLES 就送出
-        while len(self._buf) >= CHUNK_SAMPLES:
-            chunk = self._buf[:CHUNK_SAMPLES].copy()
-            self._buf = self._buf[CHUNK_SAMPLES:]
-            self._callback(chunk)
+        self._queue.put(indata[:, 0].copy())
+
+    def _consumer(self) -> None:
+        """消費者執行緒：resample + 累積 buffer + 呼叫 ASR callback。"""
+        while self._running:
+            try:
+                raw = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            # resample native_sr → 16kHz（在非即時執行緒中進行）
+            target_len = int(len(raw) * TARGET_SR / self._native_sr)
+            resampled = signal.resample(raw, target_len).astype(np.float32)
+            self._buf = np.concatenate([self._buf, resampled])
+
+            # 每累積 CHUNK_SAMPLES 就送出一次
+            while len(self._buf) >= CHUNK_SAMPLES:
+                chunk = self._buf[:CHUNK_SAMPLES].copy()
+                self._buf = self._buf[CHUNK_SAMPLES:]
+                if self._callback:
+                    self._callback(chunk)
 
     def stop(self) -> None:
+        self._running = False
         if self._stream:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        if self._consumer_thread:
+            self._consumer_thread.join(timeout=1.0)
+            self._consumer_thread = None
+        self._buf = np.zeros(0, dtype=np.float32)
 
 
 class MicrophoneAudioSource(AudioSource):
