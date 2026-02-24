@@ -216,8 +216,9 @@ class SubtitleOverlay:
     EN_FONT = ("Arial", 14)
     ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
 
-    def __init__(self, screen_index: int = 0, on_toggle_direction=None):
+    def __init__(self, screen_index: int = 0, on_toggle_direction=None, on_close=None):
         self._on_toggle_direction = on_toggle_direction
+        self._on_close = on_close
 
         monitors = get_monitors()
         if screen_index >= len(monitors):
@@ -260,7 +261,7 @@ class SubtitleOverlay:
             bg=self.BTN_BG,
             relief="flat",
             padx=8,
-            command=self._root.destroy,
+            command=self._do_close,
         ).pack(side="right", padx=4, pady=2)
 
         # 英文行
@@ -287,9 +288,15 @@ class SubtitleOverlay:
             padx=20,
         ).pack(fill="x")
 
-        # Esc 鍵退出
-        self._root.bind("<Escape>", lambda e: self._root.destroy())
+        self._root.bind("<Escape>", lambda e: self._do_close())
         self._root.bind("<F9>", lambda e: self._toggle_direction())
+        self._root.protocol("WM_DELETE_WINDOW", self._do_close)
+
+    def _do_close(self):
+        """關閉視窗，並通知背景執行緒（透過 on_close callback）。"""
+        if self._on_close:
+            self._on_close()
+        self._root.destroy()
 
     def _toggle_direction(self):
         if self._on_toggle_direction:
@@ -523,10 +530,14 @@ def main():
     )
     debouncer.set_direction(args.direction)
 
+    # 視窗關閉事件（用 Event 取代跨執行緒輪詢 winfo_exists）
+    window_closed = threading.Event()
+
     # 建立字幕視窗
     overlay = SubtitleOverlay(
         screen_index=args.screen,
         on_toggle_direction=debouncer.toggle_direction,
+        on_close=lambda: window_closed.set(),
     )
     overlay.update_direction_label(args.direction)
 
@@ -569,10 +580,7 @@ def main():
         print("[Audio] Capturing... Press Esc to stop.")
 
         try:
-            while overlay._root.winfo_exists():
-                time.sleep(0.1)
-        except Exception:
-            pass
+            window_closed.wait()  # 等待視窗關閉事件，不輪詢 tkinter
         finally:
             audio_source.stop()
             debouncer.shutdown()
