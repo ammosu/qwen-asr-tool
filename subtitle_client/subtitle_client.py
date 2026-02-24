@@ -6,16 +6,8 @@ Usage:
     python subtitle_client.py --asr-server http://<SERVER_IP>:8000 --openai-api-key sk-...
 
 Requirements:
-    pip install sounddevice numpy scipy requests openai screeninfo
+    pip install sounddevice numpy scipy requests openai
 """
-# 必須在所有 X11/tkinter/sounddevice import 之前呼叫，
-# 避免 PulseAudio PortAudio 後端的 XInitThreads() 與 tkinter 衝突。
-try:
-    import ctypes
-    ctypes.CDLL("libX11.so.6").XInitThreads()
-except Exception:
-    pass  # Windows 或找不到 libX11 時忽略
-
 import argparse
 import multiprocessing
 import os
@@ -31,7 +23,6 @@ import requests
 import scipy.signal as signal
 import tkinter as tk
 from openai import OpenAI
-from screeninfo import get_monitors
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +211,14 @@ class SubtitleOverlay:
     def __init__(self, screen_index: int = 0, on_toggle_direction=None):
         self._on_toggle_direction = on_toggle_direction
 
-        monitors = get_monitors()
-        if screen_index >= len(monitors):
-            screen_index = 0
-        m = monitors[screen_index]
-        self._x = m.x
-        self._y = m.y + m.height - self.WINDOW_HEIGHT
-        self._width = m.width
-
         self._root = tk.Tk()
+
+        # 用 tkinter 取螢幕尺寸（不依賴 screeninfo）
+        self._width = self._root.winfo_screenwidth()
+        screen_height = self._root.winfo_screenheight()
+        self._x = 0
+        self._y = screen_height - self.WINDOW_HEIGHT
+
         self._root.overrideredirect(True)
         self._root.wm_attributes("-topmost", True)
         self._root.wm_attributes("-alpha", 0.85)
@@ -514,15 +504,15 @@ def _worker_main(text_q: multiprocessing.Queue, cmd_q: multiprocessing.Queue, cf
 
     try:
         while True:
-            try:
-                cmd = cmd_q.get(timeout=0.5)
+            if not cmd_q.empty():
+                cmd = cmd_q.get()
                 if cmd == "toggle":
                     new_dir = debouncer.toggle_direction()
                     text_q.put({"direction": new_dir})
                 elif cmd == "stop":
                     break
-            except Exception:
-                pass  # queue.Empty → continue
+            else:
+                time.sleep(0.1)
     finally:
         audio_source.stop()
         debouncer.shutdown()
@@ -574,14 +564,9 @@ def main() -> None:
         "direction": args.direction,
     }
 
-    # 啟動 worker subprocess（無 X11，跑音訊 / ASR / 翻譯）
-    text_q: multiprocessing.Queue = multiprocessing.Queue()
-    cmd_q: multiprocessing.Queue = multiprocessing.Queue()
-    worker = multiprocessing.Process(
-        target=_worker_main, args=(text_q, cmd_q, cfg),
-        daemon=True, name="subtitle-worker",
-    )
-    worker.start()
+    # 準備 IPC queues（用 SimpleQueue，不會在主程序產生 feeder 背景執行緒）
+    text_q: multiprocessing.SimpleQueue = multiprocessing.SimpleQueue()
+    cmd_q: multiprocessing.SimpleQueue = multiprocessing.SimpleQueue()
 
     # 本地方向追蹤（UI 用，與 worker 同步）
     current_direction = [args.direction]
@@ -591,24 +576,28 @@ def main() -> None:
         cmd_q.put("toggle")
         return current_direction[0]
 
-    # 建立字幕視窗（主程序只有 tkinter，無 sounddevice）
+    # 先建立 tkinter（在 fork 之前完成 X11 連線，child 繼承 fd 但立即移除 DISPLAY）
     overlay = SubtitleOverlay(screen_index=args.screen, on_toggle_direction=on_toggle)
     overlay.update_direction_label(args.direction)
 
-    # 用 tkinter after() 輪詢 text_q（在主執行緒，thread-safe）
+    # tkinter 初始化後才 fork worker（child 不使用 X11）
+    worker = multiprocessing.Process(
+        target=_worker_main, args=(text_q, cmd_q, cfg),
+        daemon=True, name="subtitle-worker",
+    )
+    worker.start()
+
+    # 用 tkinter after() 輪詢 text_q（全在主執行緒，零 X11 競爭）
     def poll() -> None:
-        while True:
-            try:
-                msg = text_q.get_nowait()
-                if "direction" in msg:
-                    overlay.update_direction_label(msg["direction"])
-                else:
-                    overlay.set_text(
-                        original=msg.get("original", ""),
-                        translated=msg.get("translated", ""),
-                    )
-            except Exception:
-                break  # queue 空了
+        while not text_q.empty():
+            msg = text_q.get()
+            if "direction" in msg:
+                overlay.update_direction_label(msg["direction"])
+            else:
+                overlay.set_text(
+                    original=msg.get("original", ""),
+                    translated=msg.get("translated", ""),
+                )
         overlay._root.after(50, poll)
 
     overlay._root.after(50, poll)
@@ -622,5 +611,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn")  # 避免 fork 繼承 X11 連線
+    # spawn：全新 Python 程序，不繼承 X11 socket fd，避免 XCB 序號衝突
+    multiprocessing.set_start_method("spawn")
     main()
