@@ -12,10 +12,12 @@ import argparse
 import os
 import threading
 import time
+from abc import ABC, abstractmethod
 from typing import Callable
 
 import numpy as np
 import requests
+import scipy.signal as signal
 import tkinter as tk
 from openai import OpenAI
 from screeninfo import get_monitors
@@ -235,62 +237,95 @@ class SubtitleOverlay:
         self._root.mainloop()
 
 # ---------------------------------------------------------------------------
-# Audio Capture
+# Audio Sources
 # ---------------------------------------------------------------------------
 
 TARGET_SR = 16000
 CHUNK_SAMPLES = 8000  # 0.5 秒 @ 16kHz
 
 
-class AudioCapture:
+class AudioSource(ABC):
+    """音訊來源抽象介面。未來可新增 MicrophoneAudioSource、NetworkAudioSource 等。"""
+
+    @abstractmethod
+    def start(self, callback: Callable[[np.ndarray], None]) -> None:
+        """開始擷取音訊，每 0.5 秒以 16kHz float32 mono ndarray 呼叫 callback。"""
+
+    @abstractmethod
+    def stop(self) -> None:
+        """停止擷取。"""
+
+    @staticmethod
+    def list_devices() -> None:
+        """列出系統音訊裝置（含 monitor source）。"""
+        import sounddevice as sd
+        print(sd.query_devices())
+
+
+class MonitorAudioSource(AudioSource):
     """
-    持續擷取麥克風音訊，每 0.5 秒呼叫一次 callback。
+    擷取 PipeWire/PulseAudio monitor source（系統播放音訊）。
 
-    使用方式：
-        def on_chunk(audio: np.ndarray):
-            # audio: shape (8000,), dtype float32, 16kHz
-            pass
-
-        capture = AudioCapture(callback=on_chunk)
-        capture.start()
-        time.sleep(10)
-        capture.stop()
+    device 預設：alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor
     """
 
-    def __init__(self, callback: Callable[[np.ndarray], None], device=None):
-        self.callback = callback
-        self.device = device  # None = 系統預設麥克風
+    DEFAULT_DEVICE = "alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor"
+
+    def __init__(self, device: str | None = None):
+        self._device = device or self.DEFAULT_DEVICE
         self._stream = None
 
-    def start(self):
+    def start(self, callback: Callable[[np.ndarray], None]) -> None:
         import sounddevice as sd
+        dev_info = sd.query_devices(self._device, kind="input")
+        native_sr = int(dev_info["default_samplerate"])  # 通常 48000
+
+        self._callback = callback
+        self._native_sr = native_sr
+        self._buf = np.zeros(0, dtype=np.float32)
+
         self._stream = sd.InputStream(
-            samplerate=TARGET_SR,
+            samplerate=native_sr,
             channels=1,
             dtype="float32",
-            blocksize=CHUNK_SAMPLES,
-            device=self.device,
+            blocksize=0,                # 讓 sounddevice 決定
+            device=self._device,
             callback=self._sd_callback,
         )
         self._stream.start()
 
-    def _sd_callback(self, indata: np.ndarray, frames, time_info, status):
+    def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status):
         if status:
             print(f"[Audio] {status}")
-        chunk = indata[:, 0].copy()  # mono, shape (CHUNK_SAMPLES,)
-        self.callback(chunk)
+        mono = indata[:, 0]
+        # resample native_sr → 16000
+        target_len = int(len(mono) * TARGET_SR / self._native_sr)
+        resampled = signal.resample(mono, target_len).astype(np.float32)
+        self._buf = np.concatenate([self._buf, resampled])
+        # 每累積 CHUNK_SAMPLES 就送出
+        while len(self._buf) >= CHUNK_SAMPLES:
+            chunk = self._buf[:CHUNK_SAMPLES].copy()
+            self._buf = self._buf[CHUNK_SAMPLES:]
+            self._callback(chunk)
 
-    def stop(self):
+    def stop(self) -> None:
         if self._stream:
             self._stream.stop()
             self._stream.close()
             self._stream = None
 
-    @staticmethod
-    def list_devices():
-        """印出可用的音訊輸入裝置，供使用者用 --device 指定。"""
-        import sounddevice as sd
-        print(sd.query_devices())
+
+class MicrophoneAudioSource(AudioSource):
+    """麥克風音訊來源（預留，尚未實作）。"""
+
+    def __init__(self, device=None):
+        self._device = device
+
+    def start(self, callback: Callable[[np.ndarray], None]) -> None:
+        raise NotImplementedError("MicrophoneAudioSource 尚未實作")
+
+    def stop(self) -> None:
+        pass
 
 # ---------------------------------------------------------------------------
 # Main Entry Point
@@ -333,7 +368,7 @@ def main():
     args = parser.parse_args()
 
     if args.list_devices:
-        AudioCapture.list_devices()
+        AudioSource.list_devices()
         return
 
     if not args.openai_api_key:
@@ -377,8 +412,8 @@ def main():
             except Exception as e:
                 print(f"[ASR error] {e}")
 
-        capture = AudioCapture(callback=on_chunk, device=args.device)
-        capture.start()
+        capture = MonitorAudioSource(device=args.device)
+        capture.start(on_chunk)
         print("[Audio] Capturing... Press Esc to stop.")
 
         try:
