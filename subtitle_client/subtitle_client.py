@@ -192,18 +192,24 @@ class SubtitleOverlay:
 
     使用方式：
         overlay = SubtitleOverlay(screen_index=0)
-        overlay.set_text(en="Hello world", zh="你好世界")
+        overlay.set_text(original="Hello world", translated="你好世界")
         overlay.run()  # 阻塞，在主執行緒呼叫
     """
 
-    WINDOW_HEIGHT = 120
+    TOOLBAR_HEIGHT = 28
+    WINDOW_HEIGHT = 148         # 原 120 + TOOLBAR_HEIGHT
+    TOOLBAR_BG = "#1a1a1a"
+    BTN_COLOR = "#ffffff"
+    BTN_BG = "#333333"
     BG_COLOR = "#000000"
     EN_COLOR = "#888888"
     ZH_COLOR = "#ffffff"
     EN_FONT = ("Arial", 14)
     ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
 
-    def __init__(self, screen_index: int = 0):
+    def __init__(self, screen_index: int = 0, on_toggle_direction=None):
+        self._on_toggle_direction = on_toggle_direction
+
         monitors = get_monitors()
         if screen_index >= len(monitors):
             screen_index = 0
@@ -220,6 +226,33 @@ class SubtitleOverlay:
         self._root.geometry(
             f"{self._width}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
         )
+
+        # ── 工具列 ──
+        toolbar = tk.Frame(self._root, bg=self.TOOLBAR_BG, height=self.TOOLBAR_HEIGHT)
+        toolbar.pack(fill="x", side="top")
+
+        self._dir_btn_var = tk.StringVar(value="[EN→ZH ⇄]")
+        tk.Button(
+            toolbar,
+            textvariable=self._dir_btn_var,
+            font=("Arial", 10),
+            fg=self.BTN_COLOR,
+            bg=self.BTN_BG,
+            relief="flat",
+            padx=8,
+            command=self._toggle_direction,
+        ).pack(side="left", padx=4, pady=2)
+
+        tk.Button(
+            toolbar,
+            text="✕",
+            font=("Arial", 10),
+            fg=self.BTN_COLOR,
+            bg=self.BTN_BG,
+            relief="flat",
+            padx=8,
+            command=self._root.destroy,
+        ).pack(side="right", padx=4, pady=2)
 
         # 英文行
         self._en_var = tk.StringVar()
@@ -247,12 +280,22 @@ class SubtitleOverlay:
 
         # Esc 鍵退出
         self._root.bind("<Escape>", lambda e: self._root.destroy())
+        self._root.bind("<F9>", lambda e: self._toggle_direction())
 
-    def set_text(self, en: str = "", zh: str = ""):
+    def _toggle_direction(self):
+        if self._on_toggle_direction:
+            new_dir = self._on_toggle_direction()
+            self.update_direction_label(new_dir)
+
+    def update_direction_label(self, direction: str):
+        label = f"[{direction} ⇄]"
+        self._root.after(0, lambda: self._dir_btn_var.set(label))
+
+    def set_text(self, original: str = "", translated: str = ""):
         """從任意執行緒安全地更新字幕（用 after() 排程到主執行緒）。"""
         def _update():
-            self._en_var.set(en[:120])
-            self._zh_var.set(zh[:60])
+            self._en_var.set(original[:120])
+            self._zh_var.set(translated[:60])
         self._root.after(0, _update)
 
     def run(self):
@@ -431,15 +474,23 @@ def main():
         print("Error: --openai-api-key or OPENAI_API_KEY required")
         return
 
+    # 初始化翻譯 debouncer（先建立，overlay 的 on_toggle_direction 需要參照它）
+    debouncer_ref: list = []
+
+    def on_toggle_direction() -> str:
+        if debouncer_ref:
+            return debouncer_ref[0].toggle_direction()
+        return "en→zh"
+
     # 初始化字幕視窗
-    overlay = SubtitleOverlay(screen_index=args.screen)
+    overlay = SubtitleOverlay(screen_index=args.screen, on_toggle_direction=on_toggle_direction)
 
     # 目前的 ASR 文字（跨執行緒共享）
-    current_en = ""
+    current_original = ""
 
-    def on_translation(zh_text: str):
-        nonlocal current_en
-        overlay.set_text(en=current_en, zh=zh_text)
+    def on_translation(translated_text: str):
+        nonlocal current_original
+        overlay.set_text(original=current_original, translated=translated_text)
 
     # 初始化翻譯 debouncer
     debouncer = TranslationDebouncer(
@@ -447,23 +498,24 @@ def main():
         callback=on_translation,
         model=args.translation_model,
     )
+    debouncer_ref.append(debouncer)
 
     # 初始化 ASR client
     asr = ASRClient(args.asr_server)
 
     def run_asr():
-        nonlocal current_en
+        nonlocal current_original
         asr.start()
         print(f"[ASR] Session started: {asr.session_id}")
 
         def on_chunk(audio: np.ndarray):
-            nonlocal current_en
+            nonlocal current_original
             try:
                 result = asr.push_chunk(audio)
                 text = result.get("text", "")
-                if text != current_en:
-                    current_en = text
-                    overlay.set_text(en=text, zh="")
+                if text != current_original:
+                    current_original = text
+                    overlay.set_text(original=text, translated="")
                     debouncer.update(text)
             except Exception as e:
                 print(f"[ASR error] {e}")
