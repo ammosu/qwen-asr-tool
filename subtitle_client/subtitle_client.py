@@ -157,14 +157,17 @@ class TranslationDebouncer:
         # lock 釋放後才呼叫 OpenAI
         if direction == "en→zh":
             system_msg = (
-                "You are a real-time subtitle translator. "
-                "Translate the English speech transcript to Traditional Chinese (繁體中文台灣用語). "
-                "Output ONLY the translation, no explanations."
+                "你是即時字幕翻譯員。將英文語音轉錄翻譯成自然流暢的繁體中文（台灣口語用語）。"
+                "要求：\n"
+                "1. 依照中文語法重新組句，不要逐字翻譯或照搬英文語序\n"
+                "2. 使用台灣人日常說話的方式，口語自然\n"
+                "3. 專有名詞、人名、品牌可保留英文原文\n"
+                "4. 只輸出翻譯結果，不加任何解釋或標注"
             )
         else:  # zh→en
             system_msg = (
                 "You are a real-time subtitle translator. "
-                "Translate the Chinese speech transcript to English. "
+                "Translate the Chinese speech transcript to natural, colloquial English. "
                 "Output ONLY the translation, no explanations."
             )
         try:
@@ -497,18 +500,18 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
 
     asr = ASRClient(cfg["asr_server"])
 
-    # Silero VAD 常數（v6 模型）
-    VAD_CHUNK = 576           # 36ms @ 16kHz
-    VAD_THRESHOLD = 0.5       # 語音機率閾值
-    RT_SILENCE_CHUNKS = 22    # 22 × 36ms ≈ 0.8s 靜音後觸發 ASR
-    RT_MAX_BUFFER_CHUNKS = 150  # ~5.4s 上限強制觸發（避免長句等待太久）
+    # Silero VAD 常數（v6 模型），對應原始專案 RealtimeManager._loop() 的邏輯
+    VAD_CHUNK = 576               # 36ms @ 16kHz
+    VAD_THRESHOLD = 0.5           # 語音機率閾值
+    RT_SILENCE_CHUNKS = 22        # 22 × 36ms ≈ 0.8s 靜音後觸發轉錄
+    RT_MAX_BUFFER_CHUNKS = 138    # ~5s 上限強制轉錄（138 × 36ms ≈ 5s）
 
     # 載入 VAD 模型
     _vad_model_path = Path(__file__).parent / "silero_vad_v6.onnx"
     vad_sess = ort.InferenceSession(str(_vad_model_path))
 
     _vad_q: queue.Queue = queue.Queue()
-    _speech_q: queue.Queue = queue.Queue()
+    _speech_q: queue.Queue = queue.Queue()   # 傳送整段語音 np.ndarray
     _stop_event = threading.Event()
 
     def on_chunk(audio: np.ndarray) -> None:
@@ -516,49 +519,76 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
         _vad_q.put(audio)
 
     def vad_loop() -> None:
-        """VAD 執行緒：偵測語音/靜音，累積語音，靜音後送 ASR。"""
+        """
+        VAD 執行緒：完全對應原始 RealtimeManager._loop() 的邏輯。
+
+        - 語音：累積進 buf
+        - 靜音 0.8s 或 buf 達 ~5s 上限：把整段語音送到 _speech_q，重置狀態
+        """
         h = np.zeros((1, 1, 128), dtype=np.float32)
         c = np.zeros((1, 1, 128), dtype=np.float32)
         buf: list[np.ndarray] = []
         sil_cnt = 0
         leftover = np.zeros(0, dtype=np.float32)
 
-        while not _stop_event.is_set():
-            try:
-                audio = _vad_q.get(timeout=0.1)
-            except queue.Empty:
-                continue
+        try:
+            while not _stop_event.is_set():
+                try:
+                    audio = _vad_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
 
-            # 與上次剩餘樣本合併，切成 VAD_CHUNK 大小
-            audio = np.concatenate([leftover, audio])
-            n_chunks = len(audio) // VAD_CHUNK
-            leftover = audio[n_chunks * VAD_CHUNK:]
+                audio = np.concatenate([leftover, audio])
+                n_chunks = len(audio) // VAD_CHUNK
+                leftover = audio[n_chunks * VAD_CHUNK:]
 
-            for i in range(n_chunks):
-                chunk = audio[i * VAD_CHUNK:(i + 1) * VAD_CHUNK]
-                inp = chunk[np.newaxis, :].astype(np.float32)
-                out = vad_sess.run(
-                    ["speech_probs", "hn", "cn"],
-                    {"input": inp, "h": h, "c": c},
-                )
-                prob, h, c = out
-                prob = float(prob.flatten()[0])
+                for i in range(n_chunks):
+                    chunk = audio[i * VAD_CHUNK:(i + 1) * VAD_CHUNK]
+                    inp = chunk[np.newaxis, :].astype(np.float32)
+                    out = vad_sess.run(
+                        ["speech_probs", "hn", "cn"],
+                        {"input": inp, "h": h, "c": c},
+                    )
+                    prob, h, c = out
+                    prob = float(prob.flatten()[0])
 
-                if prob >= VAD_THRESHOLD:
-                    buf.append(chunk)
-                    sil_cnt = 0
-                elif buf:
-                    buf.append(chunk)
-                    sil_cnt += 1
-                    if sil_cnt >= RT_SILENCE_CHUNKS or len(buf) >= RT_MAX_BUFFER_CHUNKS:
+                    if prob >= VAD_THRESHOLD:
+                        buf.append(chunk)
+                        sil_cnt = 0
+                    elif buf:
+                        buf.append(chunk)
+                        sil_cnt += 1
+                        if sil_cnt >= RT_SILENCE_CHUNKS:
+                            # 靜音結束：把整段語音送出，重置
+                            _speech_q.put(np.concatenate(buf))
+                            buf = []
+                            sil_cnt = 0
+                            h = np.zeros((1, 1, 128), dtype=np.float32)
+                            c = np.zeros((1, 1, 128), dtype=np.float32)
+
+                    # 達到最大 buffer 長度，強制送出
+                    if len(buf) >= RT_MAX_BUFFER_CHUNKS:
                         _speech_q.put(np.concatenate(buf))
                         buf = []
                         sil_cnt = 0
                         h = np.zeros((1, 1, 128), dtype=np.float32)
                         c = np.zeros((1, 1, 128), dtype=np.float32)
 
+        except Exception as e:
+            print(f"[VAD fatal error] {e}", flush=True)
+            import traceback; traceback.print_exc()
+
+    def _parse_asr_text(raw: str) -> str:
+        """剝除 'language XXX<asr_text>' 前綴。"""
+        if "<asr_text>" in raw:
+            raw = raw.split("<asr_text>", 1)[1]
+        return raw.strip()
+
     def asr_loop() -> None:
-        """ASR 執行緒：等待完整語音片段，送 ASR server，更新字幕。"""
+        """
+        ASR 執行緒：收到整段語音後，一次性呼叫 start/push_chunk/finish，
+        對應原始 asr.transcribe(audio) 的單次請求。
+        """
         nonlocal current_original
 
         while not _stop_event.is_set():
@@ -567,24 +597,19 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
             except queue.Empty:
                 continue
 
-            # 確保至少 1 秒音訊
-            if len(speech) < TARGET_SR:
+            if len(speech) < TARGET_SR // 4:   # 少於 0.25s，跳過
                 continue
 
             try:
                 asr.start()
-                result = asr.push_chunk(speech)
-                text = result.get("text", "").strip()
-                try:
-                    asr.finish()
-                except Exception:
-                    pass
-
+                asr.push_chunk(speech)
+                result = asr.finish()
+                text = _parse_asr_text(result.get("text", ""))
                 if text and text != current_original:
                     current_original = text
+                    # 先立即顯示原文，翻譯完成後 debouncer callback 會更新中文
                     text_q.put({"original": text, "translated": ""})
                     debouncer.update(text)
-
             except Exception as e:
                 print(f"[Worker ASR error] {e}", flush=True)
                 try:
