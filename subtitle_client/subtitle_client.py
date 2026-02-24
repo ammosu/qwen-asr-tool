@@ -449,12 +449,6 @@ def main():
         help="Display screen index (0=primary, 1=secondary)",
     )
     parser.add_argument(
-        "--device",
-        type=int,
-        default=None,
-        help="Audio input device index (run with --list-devices to see options)",
-    )
-    parser.add_argument(
         "--list-devices",
         action="store_true",
         help="List available audio devices and exit",
@@ -463,6 +457,23 @@ def main():
         "--translation-model",
         default="gpt-4o-mini",
         help="OpenAI model for translation",
+    )
+    parser.add_argument(
+        "--source",
+        choices=["monitor", "mic"],
+        default="monitor",
+        help="Audio source type",
+    )
+    parser.add_argument(
+        "--monitor-device",
+        default=MonitorAudioSource.DEFAULT_DEVICE,
+        help="PipeWire/PulseAudio monitor device name",
+    )
+    parser.add_argument(
+        "--direction",
+        choices=["en→zh", "zh→en"],
+        default="en→zh",
+        help="Translation direction",
     )
     args = parser.parse_args()
 
@@ -474,31 +485,35 @@ def main():
         print("Error: --openai-api-key or OPENAI_API_KEY required")
         return
 
-    # 初始化翻譯 debouncer（先建立，overlay 的 on_toggle_direction 需要參照它）
-    debouncer_ref: list = []
+    # 建立翻譯 debouncer，callback 先設成佔位 lambda
+    debouncer = TranslationDebouncer(
+        api_key=args.openai_api_key,
+        callback=lambda t: None,
+        model=args.translation_model,
+    )
+    debouncer.set_direction(args.direction)
 
-    def on_toggle_direction() -> str:
-        if debouncer_ref:
-            return debouncer_ref[0].toggle_direction()
-        return "en→zh"
-
-    # 初始化字幕視窗
-    overlay = SubtitleOverlay(screen_index=args.screen, on_toggle_direction=on_toggle_direction)
+    # 建立字幕視窗
+    overlay = SubtitleOverlay(
+        screen_index=args.screen,
+        on_toggle_direction=debouncer.toggle_direction,
+    )
+    overlay.update_direction_label(args.direction)
 
     # 目前的 ASR 文字（跨執行緒共享）
     current_original = ""
 
-    def on_translation(translated_text: str):
+    def on_translation(translated: str):
         nonlocal current_original
-        overlay.set_text(original=current_original, translated=translated_text)
+        overlay.set_text(original=current_original, translated=translated)
 
-    # 初始化翻譯 debouncer
-    debouncer = TranslationDebouncer(
-        api_key=args.openai_api_key,
-        callback=on_translation,
-        model=args.translation_model,
-    )
-    debouncer_ref.append(debouncer)
+    debouncer.callback = on_translation
+
+    # 根據 args.source 選擇音訊來源
+    if args.source == "monitor":
+        audio_source = MonitorAudioSource(device=args.monitor_device)
+    else:
+        audio_source = MicrophoneAudioSource()
 
     # 初始化 ASR client
     asr = ASRClient(args.asr_server)
@@ -520,8 +535,7 @@ def main():
             except Exception as e:
                 print(f"[ASR error] {e}")
 
-        capture = MonitorAudioSource(device=args.device)
-        capture.start(on_chunk)
+        audio_source.start(on_chunk)
         print("[Audio] Capturing... Press Esc to stop.")
 
         try:
@@ -530,7 +544,7 @@ def main():
         except Exception:
             pass
         finally:
-            capture.stop()
+            audio_source.stop()
             debouncer.shutdown()
             try:
                 asr.finish()
