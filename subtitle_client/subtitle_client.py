@@ -144,11 +144,12 @@ class TranslationDebouncer:
             self._last_translated = ""
 
     def _do_translate(self, text: str):
-        if not text or text == self._last_translated:
-            return
-        self._last_translated = text
-        direction = self.direction  # snapshot，避免 race condition
-
+        with self._lock:
+            if not text or text == self._last_translated:
+                return
+            self._last_translated = text
+            direction = self.direction  # snapshot
+        # lock 釋放後才呼叫 OpenAI
         if direction == "en→zh":
             system_msg = (
                 "You are a real-time subtitle translator. "
@@ -161,7 +162,6 @@ class TranslationDebouncer:
                 "Translate the Chinese speech transcript to English. "
                 "Output ONLY the translation, no explanations."
             )
-
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
