@@ -11,6 +11,7 @@ Requirements:
 import argparse
 import os
 import queue
+import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -323,9 +324,21 @@ class AudioSource(ABC):
 
     @staticmethod
     def list_devices() -> None:
-        """列出系統音訊裝置（含 monitor source）。"""
+        """列出系統音訊裝置及 PulseAudio monitor sources。"""
         import sounddevice as sd
+        print("=== ALSA 裝置清單 ===")
         print(sd.query_devices())
+        print("\n=== PulseAudio Monitor Sources（可用於 --monitor-device）===")
+        try:
+            result = subprocess.run(
+                ["pactl", "list", "sources", "short"],
+                capture_output=True, text=True, timeout=3,
+            )
+            for line in result.stdout.splitlines():
+                if "monitor" in line.lower():
+                    print(" ", line)
+        except Exception:
+            print("  （無法取得 PulseAudio sources，請確認 pactl 已安裝）")
 
 
 class MonitorAudioSource(AudioSource):
@@ -335,13 +348,17 @@ class MonitorAudioSource(AudioSource):
     使用 queue.Queue 解耦音訊 callback 與 ASR HTTP 請求，避免
     阻塞操作污染即時音訊執行緒。
 
+    透過 ALSA pulse 設備 + PULSE_SOURCE 環境變數選擇 monitor source，
+    讓 sounddevice 能存取 PipeWire/PulseAudio monitor。
+
     device 預設：alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor
     """
 
     DEFAULT_DEVICE = "alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor"
+    ALSA_PULSE_DEVICE = "pulse"  # ALSA pulse plugin，透過它存取 PulseAudio
 
     def __init__(self, device: str | None = None):
-        self._device = device or self.DEFAULT_DEVICE
+        self._device = device or self.DEFAULT_DEVICE  # PulseAudio source 名稱
         self._stream = None
         self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
         self._native_sr: int = 0
@@ -355,8 +372,13 @@ class MonitorAudioSource(AudioSource):
             raise RuntimeError("MonitorAudioSource is already running; call stop() first.")
 
         import sounddevice as sd
-        dev_info = sd.query_devices(self._device, kind="input")
-        self._native_sr = int(dev_info["default_samplerate"])  # 通常 48000
+
+        # 設定 PULSE_SOURCE 讓 PulseAudio 使用指定的 monitor source
+        os.environ["PULSE_SOURCE"] = self._device
+
+        # 透過 ALSA pulse 設備取得 native samplerate
+        dev_info = sd.query_devices(self.ALSA_PULSE_DEVICE, kind="input")
+        self._native_sr = int(dev_info["default_samplerate"])  # 通常 44100 或 48000
         self._callback = callback
         self._buf = np.zeros(0, dtype=np.float32)
         self._running = True
@@ -371,7 +393,7 @@ class MonitorAudioSource(AudioSource):
             channels=1,
             dtype="float32",
             blocksize=int(self._native_sr * 0.05),  # 50ms 固定 buffer
-            device=self._device,
+            device=self.ALSA_PULSE_DEVICE,
             callback=self._sd_callback,
         )
         self._stream.start()
