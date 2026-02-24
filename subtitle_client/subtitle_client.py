@@ -461,17 +461,21 @@ class MicrophoneAudioSource(AudioSource):
 
 def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.SimpleQueue, cfg: dict) -> None:
     """
-    在獨立 subprocess 執行：sounddevice + ASR + 翻譯。
+    在獨立 subprocess 執行：sounddevice + VAD + ASR + 翻譯。
     完全不使用 X11/tkinter，避免與主程序的 XCB 衝突。
 
     text_q: 送出 {"original": str, "translated": str} 或 {"direction": str}
     cmd_q:  接收 "toggle"（切換翻譯方向）或 "stop"
 
     架構：
-    - on_chunk：非阻塞，只更新滾動音訊緩衝區
-    - asr_loop：獨立執行緒，每 STEP_SEC 秒取最近 WINDOW_SEC 秒音訊，
-                開新 session 送出，避免 vLLM 累積音訊導致推理時間無限增長
+    - on_chunk：非阻塞，只把音訊放入 _vad_q
+    - vad_loop：Silero VAD 偵測語音/靜音，累積語音片段，
+                靜音 ~0.8s 後把完整語音放入 _speech_q
+    - asr_loop：等待 _speech_q，送到 ASR server，更新字幕
     """
+    import onnxruntime as ort
+    from pathlib import Path
+
     os.environ.pop("DISPLAY", None)
 
     current_original = ""
@@ -493,58 +497,94 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
 
     asr = ASRClient(cfg["asr_server"])
 
-    # 滾動音訊緩衝區：保留最近 WINDOW_SEC 秒
-    # chunk_size_sec=1.0（server 預設），送 N 秒音訊會觸發 N 次 vLLM 推理
-    # 保持短窗口，讓每次 push_chunk 只觸發 2 次推理（~2s latency）
-    WINDOW_SEC = 2
-    STEP_SEC = 0.0        # 推理結束後立即進下一輪
-    MAX_SAMPLES = int(WINDOW_SEC * TARGET_SR)
+    # Silero VAD 常數（v6 模型）
+    VAD_CHUNK = 576           # 36ms @ 16kHz
+    VAD_THRESHOLD = 0.5       # 語音機率閾值
+    RT_SILENCE_CHUNKS = 22    # 22 × 36ms ≈ 0.8s 靜音後觸發 ASR
+    RT_MAX_BUFFER_CHUNKS = 150  # ~5.4s 上限強制觸發（避免長句等待太久）
 
-    _rolling_lock = threading.Lock()
-    _rolling_holder: list[np.ndarray] = [np.zeros(0, dtype=np.float32)]
+    # 載入 VAD 模型
+    _vad_model_path = Path(__file__).parent / "silero_vad_v6.onnx"
+    vad_sess = ort.InferenceSession(str(_vad_model_path))
+
+    _vad_q: queue.Queue = queue.Queue()
+    _speech_q: queue.Queue = queue.Queue()
     _stop_event = threading.Event()
 
     def on_chunk(audio: np.ndarray) -> None:
-        """非阻塞：只更新滾動緩衝區，絕不做任何 HTTP 呼叫。"""
-        with _rolling_lock:
-            combined = np.concatenate([_rolling_holder[0], audio])
-            _rolling_holder[0] = combined[-MAX_SAMPLES:] if len(combined) > MAX_SAMPLES else combined
+        """非阻塞：只把音訊放入 VAD 佇列。"""
+        _vad_q.put(audio)
+
+    def vad_loop() -> None:
+        """VAD 執行緒：偵測語音/靜音，累積語音，靜音後送 ASR。"""
+        h = np.zeros((1, 1, 128), dtype=np.float32)
+        c = np.zeros((1, 1, 128), dtype=np.float32)
+        buf: list[np.ndarray] = []
+        sil_cnt = 0
+        leftover = np.zeros(0, dtype=np.float32)
+
+        while not _stop_event.is_set():
+            try:
+                audio = _vad_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            # 與上次剩餘樣本合併，切成 VAD_CHUNK 大小
+            audio = np.concatenate([leftover, audio])
+            n_chunks = len(audio) // VAD_CHUNK
+            leftover = audio[n_chunks * VAD_CHUNK:]
+
+            for i in range(n_chunks):
+                chunk = audio[i * VAD_CHUNK:(i + 1) * VAD_CHUNK]
+                inp = chunk[np.newaxis, :].astype(np.float32)
+                out = vad_sess.run(
+                    ["speech_probs", "hn", "cn"],
+                    {"input": inp, "h": h, "c": c},
+                )
+                prob, h, c = out
+                prob = float(prob.flatten()[0])
+
+                if prob >= VAD_THRESHOLD:
+                    buf.append(chunk)
+                    sil_cnt = 0
+                elif buf:
+                    buf.append(chunk)
+                    sil_cnt += 1
+                    if sil_cnt >= RT_SILENCE_CHUNKS or len(buf) >= RT_MAX_BUFFER_CHUNKS:
+                        _speech_q.put(np.concatenate(buf))
+                        buf = []
+                        sil_cnt = 0
+                        h = np.zeros((1, 1, 128), dtype=np.float32)
+                        c = np.zeros((1, 1, 128), dtype=np.float32)
 
     def asr_loop() -> None:
-        """獨立執行緒：每 STEP_SEC 秒取一次最近音訊，開新 session 送 ASR。"""
+        """ASR 執行緒：等待完整語音片段，送 ASR server，更新字幕。"""
         nonlocal current_original
+
         while not _stop_event.is_set():
-            _stop_event.wait(timeout=STEP_SEC if STEP_SEC > 0 else 0.1)
-            if _stop_event.is_set():
-                break
+            try:
+                speech = _speech_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-            with _rolling_lock:
-                buf = _rolling_holder[0].copy()
-
-            if len(buf) < TARGET_SR:  # 少於 1 秒，略過
+            # 確保至少 1 秒音訊
+            if len(speech) < TARGET_SR:
                 continue
 
             try:
                 asr.start()
-                result = asr.push_chunk(buf)
+                result = asr.push_chunk(speech)
                 text = result.get("text", "").strip()
-
-                # 非同步清理 session，不等待 finish() 推理，減少延遲
-                _sid = asr.session_id
-                _url = asr.base_url
-                asr.session_id = None
-                def _async_finish(sid=_sid, url=_url):
-                    try:
-                        requests.post(f"{url}/api/finish",
-                                      params={"session_id": sid}, timeout=15)
-                    except Exception:
-                        pass
-                threading.Thread(target=_async_finish, daemon=True).start()
+                try:
+                    asr.finish()
+                except Exception:
+                    pass
 
                 if text and text != current_original:
                     current_original = text
                     text_q.put({"original": text, "translated": ""})
                     debouncer.update(text)
+
             except Exception as e:
                 print(f"[Worker ASR error] {e}", flush=True)
                 try:
@@ -552,7 +592,9 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                 except Exception:
                     pass
 
+    vad_thread = threading.Thread(target=vad_loop, daemon=True, name="vad-thread")
     asr_thread = threading.Thread(target=asr_loop, daemon=True, name="asr-thread")
+    vad_thread.start()
     asr_thread.start()
 
     audio_source.start(on_chunk)
@@ -573,6 +615,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
         _stop_event.set()
         audio_source.stop()
         debouncer.shutdown()
+        vad_thread.join(timeout=3)
         asr_thread.join(timeout=5)
         try:
             asr.finish()
