@@ -53,7 +53,7 @@ class ASRClient:
             params={"session_id": self.session_id},
             data=audio_float32.tobytes(),
             headers={"Content-Type": "application/octet-stream"},
-            timeout=10,
+            timeout=60,
         )
         r.raise_for_status()
         return r.json()
@@ -104,22 +104,26 @@ class TranslationDebouncer:
 
     def update(self, text: str):
         """每次 ASR 更新時呼叫。text 是目前的完整轉錄文字。"""
+        translate_now = None
         with self._lock:
             if text == self._pending_text:
                 return
             self._pending_text = text
 
-            # 句尾立即翻譯
+            # 句尾立即翻譯（注意：_do_translate 必須在 lock 釋放後呼叫）
             if text and text[-1] in self.SENTENCE_ENDINGS:
                 self._cancel_timer()
-                self._do_translate(text)
-                return
+                translate_now = text
+            else:
+                # 一般 debounce
+                self._cancel_timer()
+                self._timer = threading.Timer(self.DEBOUNCE_SEC, self._on_timer)
+                self._timer.daemon = True
+                self._timer.start()
 
-            # 一般 debounce
-            self._cancel_timer()
-            self._timer = threading.Timer(self.DEBOUNCE_SEC, self._on_timer)
-            self._timer.daemon = True
-            self._timer.start()
+        # lock 已釋放，才可呼叫 OpenAI（否則 _do_translate 內的 with self._lock 會死鎖）
+        if translate_now:
+            self._do_translate(translate_now)
 
     def _cancel_timer(self):
         if self._timer:
@@ -298,8 +302,8 @@ class SubtitleOverlay:
     def set_text(self, original: str = "", translated: str = ""):
         """從任意執行緒安全地更新字幕（用 after() 排程到主執行緒）。"""
         def _update():
-            self._en_var.set(original[:120])
-            self._zh_var.set(translated[:60])
+            self._en_var.set(original[-120:] if len(original) > 120 else original)
+            self._zh_var.set(translated[-60:] if len(translated) > 60 else translated)
         self._root.after(0, _update)
 
     def run(self):
@@ -455,15 +459,19 @@ class MicrophoneAudioSource(AudioSource):
 # Worker Process（音訊 + ASR + 翻譯，無 X11）
 # ---------------------------------------------------------------------------
 
-def _worker_main(text_q: multiprocessing.Queue, cmd_q: multiprocessing.Queue, cfg: dict) -> None:
+def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.SimpleQueue, cfg: dict) -> None:
     """
     在獨立 subprocess 執行：sounddevice + ASR + 翻譯。
     完全不使用 X11/tkinter，避免與主程序的 XCB 衝突。
 
     text_q: 送出 {"original": str, "translated": str} 或 {"direction": str}
     cmd_q:  接收 "toggle"（切換翻譯方向）或 "stop"
+
+    架構：
+    - on_chunk：非阻塞，只更新滾動音訊緩衝區
+    - asr_loop：獨立執行緒，每 STEP_SEC 秒取最近 WINDOW_SEC 秒音訊，
+                開新 session 送出，避免 vLLM 累積音訊導致推理時間無限增長
     """
-    # 移除 DISPLAY，防止 PulseAudio libpulse 嘗試連線 X11
     os.environ.pop("DISPLAY", None)
 
     current_original = ""
@@ -485,20 +493,68 @@ def _worker_main(text_q: multiprocessing.Queue, cmd_q: multiprocessing.Queue, cf
 
     asr = ASRClient(cfg["asr_server"])
 
-    def on_chunk(audio: np.ndarray) -> None:
-        nonlocal current_original
-        try:
-            result = asr.push_chunk(audio)
-            text = result.get("text", "")
-            if text != current_original:
-                current_original = text
-                text_q.put({"original": text, "translated": ""})
-                debouncer.update(text)
-        except Exception as e:
-            print(f"[Worker ASR error] {e}", flush=True)
+    # 滾動音訊緩衝區：保留最近 WINDOW_SEC 秒
+    # chunk_size_sec=1.0（server 預設），送 N 秒音訊會觸發 N 次 vLLM 推理
+    # 保持短窗口，讓每次 push_chunk 只觸發 2 次推理（~2s latency）
+    WINDOW_SEC = 2
+    STEP_SEC = 0.0        # 推理結束後立即進下一輪
+    MAX_SAMPLES = int(WINDOW_SEC * TARGET_SR)
 
-    asr.start()
-    print(f"[Worker] ASR session: {asr.session_id}", flush=True)
+    _rolling_lock = threading.Lock()
+    _rolling_holder: list[np.ndarray] = [np.zeros(0, dtype=np.float32)]
+    _stop_event = threading.Event()
+
+    def on_chunk(audio: np.ndarray) -> None:
+        """非阻塞：只更新滾動緩衝區，絕不做任何 HTTP 呼叫。"""
+        with _rolling_lock:
+            combined = np.concatenate([_rolling_holder[0], audio])
+            _rolling_holder[0] = combined[-MAX_SAMPLES:] if len(combined) > MAX_SAMPLES else combined
+
+    def asr_loop() -> None:
+        """獨立執行緒：每 STEP_SEC 秒取一次最近音訊，開新 session 送 ASR。"""
+        nonlocal current_original
+        while not _stop_event.is_set():
+            _stop_event.wait(timeout=STEP_SEC if STEP_SEC > 0 else 0.1)
+            if _stop_event.is_set():
+                break
+
+            with _rolling_lock:
+                buf = _rolling_holder[0].copy()
+
+            if len(buf) < TARGET_SR:  # 少於 1 秒，略過
+                continue
+
+            try:
+                asr.start()
+                result = asr.push_chunk(buf)
+                text = result.get("text", "").strip()
+
+                # 非同步清理 session，不等待 finish() 推理，減少延遲
+                _sid = asr.session_id
+                _url = asr.base_url
+                asr.session_id = None
+                def _async_finish(sid=_sid, url=_url):
+                    try:
+                        requests.post(f"{url}/api/finish",
+                                      params={"session_id": sid}, timeout=15)
+                    except Exception:
+                        pass
+                threading.Thread(target=_async_finish, daemon=True).start()
+
+                if text and text != current_original:
+                    current_original = text
+                    text_q.put({"original": text, "translated": ""})
+                    debouncer.update(text)
+            except Exception as e:
+                print(f"[Worker ASR error] {e}", flush=True)
+                try:
+                    asr.finish()
+                except Exception:
+                    pass
+
+    asr_thread = threading.Thread(target=asr_loop, daemon=True, name="asr-thread")
+    asr_thread.start()
+
     audio_source.start(on_chunk)
     print("[Worker] Audio capture started.", flush=True)
 
@@ -514,8 +570,10 @@ def _worker_main(text_q: multiprocessing.Queue, cmd_q: multiprocessing.Queue, cf
             else:
                 time.sleep(0.1)
     finally:
+        _stop_event.set()
         audio_source.stop()
         debouncer.shutdown()
+        asr_thread.join(timeout=5)
         try:
             asr.finish()
         except Exception:
