@@ -17,6 +17,7 @@ except Exception:
     pass  # Windows 或找不到 libX11 時忽略
 
 import argparse
+import multiprocessing
 import os
 import queue
 import subprocess
@@ -216,9 +217,8 @@ class SubtitleOverlay:
     EN_FONT = ("Arial", 14)
     ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
 
-    def __init__(self, screen_index: int = 0, on_toggle_direction=None, on_close=None):
+    def __init__(self, screen_index: int = 0, on_toggle_direction=None):
         self._on_toggle_direction = on_toggle_direction
-        self._on_close = on_close
 
         monitors = get_monitors()
         if screen_index >= len(monitors):
@@ -293,9 +293,7 @@ class SubtitleOverlay:
         self._root.protocol("WM_DELETE_WINDOW", self._do_close)
 
     def _do_close(self):
-        """關閉視窗，並通知背景執行緒（透過 on_close callback）。"""
-        if self._on_close:
-            self._on_close()
+        """關閉視窗。"""
         self._root.destroy()
 
     def _toggle_direction(self):
@@ -464,54 +462,99 @@ class MicrophoneAudioSource(AudioSource):
         pass
 
 # ---------------------------------------------------------------------------
+# Worker Process（音訊 + ASR + 翻譯，無 X11）
+# ---------------------------------------------------------------------------
+
+def _worker_main(text_q: multiprocessing.Queue, cmd_q: multiprocessing.Queue, cfg: dict) -> None:
+    """
+    在獨立 subprocess 執行：sounddevice + ASR + 翻譯。
+    完全不使用 X11/tkinter，避免與主程序的 XCB 衝突。
+
+    text_q: 送出 {"original": str, "translated": str} 或 {"direction": str}
+    cmd_q:  接收 "toggle"（切換翻譯方向）或 "stop"
+    """
+    # 移除 DISPLAY，防止 PulseAudio libpulse 嘗試連線 X11
+    os.environ.pop("DISPLAY", None)
+
+    current_original = ""
+
+    def on_translation(translated: str) -> None:
+        text_q.put({"original": current_original, "translated": translated})
+
+    debouncer = TranslationDebouncer(
+        api_key=cfg["openai_api_key"],
+        callback=on_translation,
+        model=cfg["translation_model"],
+    )
+    debouncer.set_direction(cfg["direction"])
+
+    if cfg["source"] == "monitor":
+        audio_source = MonitorAudioSource(device=cfg["monitor_device"])
+    else:
+        audio_source = MicrophoneAudioSource()
+
+    asr = ASRClient(cfg["asr_server"])
+
+    def on_chunk(audio: np.ndarray) -> None:
+        nonlocal current_original
+        try:
+            result = asr.push_chunk(audio)
+            text = result.get("text", "")
+            if text != current_original:
+                current_original = text
+                text_q.put({"original": text, "translated": ""})
+                debouncer.update(text)
+        except Exception as e:
+            print(f"[Worker ASR error] {e}", flush=True)
+
+    asr.start()
+    print(f"[Worker] ASR session: {asr.session_id}", flush=True)
+    audio_source.start(on_chunk)
+    print("[Worker] Audio capture started.", flush=True)
+
+    try:
+        while True:
+            try:
+                cmd = cmd_q.get(timeout=0.5)
+                if cmd == "toggle":
+                    new_dir = debouncer.toggle_direction()
+                    text_q.put({"direction": new_dir})
+                elif cmd == "stop":
+                    break
+            except Exception:
+                pass  # queue.Empty → continue
+    finally:
+        audio_source.stop()
+        debouncer.shutdown()
+        try:
+            asr.finish()
+        except Exception:
+            pass
+        print("[Worker] Stopped.", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Main Entry Point
 # ---------------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Real-time subtitle overlay")
-    parser.add_argument(
-        "--asr-server",
-        default="http://localhost:8000",
-        help="Qwen3-ASR streaming server URL (e.g. http://192.168.1.100:8000)",
-    )
-    parser.add_argument(
-        "--openai-api-key",
-        default=os.environ.get("OPENAI_API_KEY", ""),
-        help="OpenAI API key (or set OPENAI_API_KEY env var)",
-    )
-    parser.add_argument(
-        "--screen",
-        type=int,
-        default=0,
-        help="Display screen index (0=primary, 1=secondary)",
-    )
-    parser.add_argument(
-        "--list-devices",
-        action="store_true",
-        help="List available audio devices and exit",
-    )
-    parser.add_argument(
-        "--translation-model",
-        default="gpt-4o-mini",
-        help="OpenAI model for translation",
-    )
-    parser.add_argument(
-        "--source",
-        choices=["monitor", "mic"],
-        default="monitor",
-        help="Audio source type",
-    )
-    parser.add_argument(
-        "--monitor-device",
-        default=MonitorAudioSource.DEFAULT_DEVICE,
-        help="PipeWire/PulseAudio monitor device name",
-    )
-    parser.add_argument(
-        "--direction",
-        choices=["en→zh", "zh→en"],
-        default="en→zh",
-        help="Translation direction",
-    )
+    parser.add_argument("--asr-server", default="http://localhost:8000",
+                        help="Qwen3-ASR streaming server URL")
+    parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""),
+                        help="OpenAI API key (or set OPENAI_API_KEY env var)")
+    parser.add_argument("--screen", type=int, default=0,
+                        help="Display screen index (0=primary, 1=secondary)")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List available audio devices and exit")
+    parser.add_argument("--translation-model", default="gpt-4o-mini",
+                        help="OpenAI model for translation")
+    parser.add_argument("--source", choices=["monitor", "mic"], default="monitor",
+                        help="Audio source: monitor（系統音訊）or mic（麥克風）")
+    parser.add_argument("--monitor-device", default=MonitorAudioSource.DEFAULT_DEVICE,
+                        help="PulseAudio monitor source name（用 --list-devices 查詢）")
+    parser.add_argument("--direction", choices=["en→zh", "zh→en"], default="en→zh",
+                        help="Initial translation direction")
     args = parser.parse_args()
 
     if args.list_devices:
@@ -519,84 +562,65 @@ def main():
         return
 
     if not args.openai_api_key:
-        print("Error: --openai-api-key or OPENAI_API_KEY required")
+        print("Error: --openai-api-key 或 OPENAI_API_KEY 環境變數必須設定")
         return
 
-    # 建立翻譯 debouncer，callback 先設成佔位 lambda
-    debouncer = TranslationDebouncer(
-        api_key=args.openai_api_key,
-        callback=lambda t: None,
-        model=args.translation_model,
-    )
-    debouncer.set_direction(args.direction)
+    cfg = {
+        "asr_server": args.asr_server,
+        "openai_api_key": args.openai_api_key,
+        "translation_model": args.translation_model,
+        "source": args.source,
+        "monitor_device": args.monitor_device,
+        "direction": args.direction,
+    }
 
-    # 視窗關閉事件（用 Event 取代跨執行緒輪詢 winfo_exists）
-    window_closed = threading.Event()
-
-    # 建立字幕視窗
-    overlay = SubtitleOverlay(
-        screen_index=args.screen,
-        on_toggle_direction=debouncer.toggle_direction,
-        on_close=lambda: window_closed.set(),
+    # 啟動 worker subprocess（無 X11，跑音訊 / ASR / 翻譯）
+    text_q: multiprocessing.Queue = multiprocessing.Queue()
+    cmd_q: multiprocessing.Queue = multiprocessing.Queue()
+    worker = multiprocessing.Process(
+        target=_worker_main, args=(text_q, cmd_q, cfg),
+        daemon=True, name="subtitle-worker",
     )
+    worker.start()
+
+    # 本地方向追蹤（UI 用，與 worker 同步）
+    current_direction = [args.direction]
+
+    def on_toggle() -> str:
+        current_direction[0] = "zh→en" if current_direction[0] == "en→zh" else "en→zh"
+        cmd_q.put("toggle")
+        return current_direction[0]
+
+    # 建立字幕視窗（主程序只有 tkinter，無 sounddevice）
+    overlay = SubtitleOverlay(screen_index=args.screen, on_toggle_direction=on_toggle)
     overlay.update_direction_label(args.direction)
 
-    # 目前的 ASR 文字（跨執行緒共享）
-    current_original = ""
-
-    def on_translation(translated: str):
-        nonlocal current_original
-        overlay.set_text(original=current_original, translated=translated)
-
-    debouncer.callback = on_translation
-
-    # 根據 args.source 選擇音訊來源
-    if args.source == "monitor":
-        audio_source = MonitorAudioSource(device=args.monitor_device)
-    else:
-        audio_source = MicrophoneAudioSource()
-
-    # 初始化 ASR client
-    asr = ASRClient(args.asr_server)
-
-    def run_asr():
-        nonlocal current_original
-        asr.start()
-        print(f"[ASR] Session started: {asr.session_id}")
-
-        def on_chunk(audio: np.ndarray):
-            nonlocal current_original
+    # 用 tkinter after() 輪詢 text_q（在主執行緒，thread-safe）
+    def poll() -> None:
+        while True:
             try:
-                result = asr.push_chunk(audio)
-                text = result.get("text", "")
-                if text != current_original:
-                    current_original = text
-                    overlay.set_text(original=text, translated="")
-                    debouncer.update(text)
-            except Exception as e:
-                print(f"[ASR error] {e}")
-
-        audio_source.start(on_chunk)
-        print("[Audio] Capturing... Press Esc to stop.")
-
-        try:
-            window_closed.wait()  # 等待視窗關閉事件，不輪詢 tkinter
-        finally:
-            audio_source.stop()
-            debouncer.shutdown()
-            try:
-                asr.finish()
+                msg = text_q.get_nowait()
+                if "direction" in msg:
+                    overlay.update_direction_label(msg["direction"])
+                else:
+                    overlay.set_text(
+                        original=msg.get("original", ""),
+                        translated=msg.get("translated", ""),
+                    )
             except Exception:
-                pass
-            print("[ASR] Session finished.")
+                break  # queue 空了
+        overlay._root.after(50, poll)
 
-    # ASR 在背景執行緒跑
-    asr_thread = threading.Thread(target=run_asr, daemon=True)
-    asr_thread.start()
+    overlay._root.after(50, poll)
+    overlay.run()  # blocking，直到視窗關閉
 
-    # tkinter mainloop 在主執行緒（blocking）
-    overlay.run()
+    # 視窗關閉後停止 worker
+    cmd_q.put("stop")
+    worker.join(timeout=3)
+    if worker.is_alive():
+        worker.terminate()
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method("spawn")  # 避免 fork 繼承 X11 連線
     main()
