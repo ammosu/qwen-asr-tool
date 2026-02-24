@@ -94,6 +94,7 @@ class TranslationDebouncer:
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.callback = callback
+        self.direction: str = "en→zh"   # 目前翻譯方向
 
         self._last_translated = ""
         self._pending_text = ""
@@ -129,29 +130,50 @@ class TranslationDebouncer:
             text = self._pending_text
         self._do_translate(text)
 
+    def toggle_direction(self) -> str:
+        """切換翻譯方向，回傳新方向字串。"""
+        with self._lock:
+            self.direction = "zh→en" if self.direction == "en→zh" else "en→zh"
+            self._last_translated = ""  # 清空快取，強制重新翻譯
+            return self.direction
+
+    def set_direction(self, direction: str) -> None:
+        """直接設定方向（'en→zh' 或 'zh→en'）。"""
+        with self._lock:
+            self.direction = direction
+            self._last_translated = ""
+
     def _do_translate(self, text: str):
         if not text or text == self._last_translated:
             return
         self._last_translated = text
+        direction = self.direction  # snapshot，避免 race condition
+
+        if direction == "en→zh":
+            system_msg = (
+                "You are a real-time subtitle translator. "
+                "Translate the English speech transcript to Traditional Chinese (繁體中文台灣用語). "
+                "Output ONLY the translation, no explanations."
+            )
+        else:  # zh→en
+            system_msg = (
+                "You are a real-time subtitle translator. "
+                "Translate the Chinese speech transcript to English. "
+                "Output ONLY the translation, no explanations."
+            )
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a real-time subtitle translator. "
-                            "Translate the English speech transcript to Traditional Chinese (繁體中文). "
-                            "Output ONLY the translation, no explanations."
-                        ),
-                    },
+                    {"role": "system", "content": system_msg},
                     {"role": "user", "content": text},
                 ],
                 max_tokens=200,
                 temperature=0.1,
             )
-            zh = response.choices[0].message.content.strip()
-            self.callback(zh)
+            translated = response.choices[0].message.content.strip()
+            self.callback(translated)
         except Exception as e:
             print(f"[Translation error] {e}")
 
