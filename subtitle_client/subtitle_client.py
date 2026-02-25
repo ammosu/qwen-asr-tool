@@ -13,6 +13,7 @@ import multiprocessing
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -334,41 +335,59 @@ class AudioSource(ABC):
 
     @staticmethod
     def list_devices() -> None:
-        """列出系統音訊裝置及 PulseAudio monitor sources。"""
+        """列出系統音訊裝置。"""
         import sounddevice as sd
-        print("=== ALSA 裝置清單 ===")
+        print("=== 音訊裝置清單 ===")
         print(sd.query_devices())
-        print("\n=== PulseAudio Monitor Sources（可用於 --monitor-device）===")
-        try:
-            result = subprocess.run(
-                ["pactl", "list", "sources", "short"],
-                capture_output=True, text=True, timeout=3,
-            )
-            for line in result.stdout.splitlines():
-                if "monitor" in line.lower():
-                    print(" ", line)
-        except Exception:
-            print("  （無法取得 PulseAudio sources，請確認 pactl 已安裝）")
+        if sys.platform == "win32":
+            print("\n=== WASAPI Loopback 可用裝置（可用於 --monitor-device）===")
+            try:
+                wasapi_idx = next(
+                    (i for i, api in enumerate(sd.query_hostapis()) if "wasapi" in api["name"].lower()),
+                    None,
+                )
+                if wasapi_idx is not None:
+                    for i, dev in enumerate(sd.query_devices()):
+                        if dev["hostapi"] == wasapi_idx and dev["max_output_channels"] > 0:
+                            print(f"  [{i}] {dev['name']} "
+                                  f"({dev['max_output_channels']}ch, {int(dev['default_samplerate'])}Hz)")
+                else:
+                    print("  （找不到 WASAPI host API）")
+            except Exception as e:
+                print(f"  （無法列出 WASAPI 裝置：{e}）")
+        else:
+            print("\n=== PulseAudio Monitor Sources（可用於 --monitor-device）===")
+            try:
+                result = subprocess.run(
+                    ["pactl", "list", "sources", "short"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                for line in result.stdout.splitlines():
+                    if "monitor" in line.lower():
+                        print(" ", line)
+            except Exception:
+                print("  （無法取得 PulseAudio sources，請確認 pactl 已安裝）")
 
 
 class MonitorAudioSource(AudioSource):
     """
-    擷取 PipeWire/PulseAudio monitor source（系統播放音訊）。
+    擷取系統播放音訊。
+
+    - Linux:   PipeWire/PulseAudio monitor source（透過 PULSE_SOURCE + ALSA pulse）
+    - Windows: WASAPI Loopback（透過 sounddevice WasapiSettings）
 
     使用 queue.Queue 解耦音訊 callback 與 ASR HTTP 請求，避免
     阻塞操作污染即時音訊執行緒。
-
-    透過 ALSA pulse 設備 + PULSE_SOURCE 環境變數選擇 monitor source，
-    讓 sounddevice 能存取 PipeWire/PulseAudio monitor。
-
-    device 預設：alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor
     """
 
-    DEFAULT_DEVICE = "alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor"
-    ALSA_PULSE_DEVICE = "pulse"  # ALSA pulse plugin，透過它存取 PulseAudio
+    # Linux 預設 monitor source；Windows 為 None（自動偵測預設輸出裝置）
+    DEFAULT_DEVICE = None if sys.platform == "win32" else "alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor"
+    ALSA_PULSE_DEVICE = "pulse"  # Linux only：ALSA pulse plugin
 
     def __init__(self, device: str | None = None):
-        self._device = device or self.DEFAULT_DEVICE  # PulseAudio source 名稱
+        # Linux: PulseAudio source 名稱（None → DEFAULT_DEVICE）
+        # Windows: 輸出裝置名稱或索引（None → 自動偵測預設輸出）
+        self._device = device if sys.platform == "win32" else (device or self.DEFAULT_DEVICE)
         self._stream = None
         self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
         self._native_sr: int = 0
@@ -383,21 +402,25 @@ class MonitorAudioSource(AudioSource):
 
         import sounddevice as sd
 
-        # 設定 PULSE_SOURCE 讓 PulseAudio 使用指定的 monitor source
-        os.environ["PULSE_SOURCE"] = self._device
-
-        # 透過 ALSA pulse 設備取得 native samplerate
-        dev_info = sd.query_devices(self.ALSA_PULSE_DEVICE, kind="input")
-        self._native_sr = int(dev_info["default_samplerate"])  # 通常 44100 或 48000
         self._callback = callback
         self._buf = np.zeros(0, dtype=np.float32)
         self._running = True
 
+        if sys.platform == "win32":
+            self._setup_windows(sd)
+        else:
+            self._setup_linux(sd)
+
         # 消費者執行緒：從 queue 取音訊、resample、送 callback
         self._consumer_thread = threading.Thread(target=self._consumer, daemon=True)
         self._consumer_thread.start()
+        self._stream.start()
 
-        # 音訊 stream：callback 只做 enqueue（不阻塞）
+    def _setup_linux(self, sd) -> None:
+        """Linux：透過 PULSE_SOURCE + ALSA pulse device 擷取 monitor source。"""
+        os.environ["PULSE_SOURCE"] = self._device
+        dev_info = sd.query_devices(self.ALSA_PULSE_DEVICE, kind="input")
+        self._native_sr = int(dev_info["default_samplerate"])  # 通常 44100 或 48000
         self._stream = sd.InputStream(
             samplerate=self._native_sr,
             channels=1,
@@ -406,7 +429,45 @@ class MonitorAudioSource(AudioSource):
             device=self.ALSA_PULSE_DEVICE,
             callback=self._sd_callback,
         )
-        self._stream.start()
+
+    def _setup_windows(self, sd) -> None:
+        """Windows：透過 WASAPI Loopback 擷取系統播放音訊。"""
+        # 找 WASAPI host API 索引
+        wasapi_idx = next(
+            (i for i, api in enumerate(sd.query_hostapis()) if "wasapi" in api["name"].lower()),
+            None,
+        )
+        if wasapi_idx is None:
+            raise RuntimeError("找不到 WASAPI host API，請確認 Windows 音訊驅動正常")
+
+        if self._device is not None:
+            # 使用者指定裝置名稱或索引
+            output_dev = self._device
+            dev_info = sd.query_devices(output_dev)
+        else:
+            # 自動偵測：找預設輸出裝置對應的 WASAPI 裝置
+            default_out_name = sd.query_devices(kind="output")["name"]
+            output_dev = next(
+                (i for i, d in enumerate(sd.query_devices())
+                 if d["hostapi"] == wasapi_idx and d["name"] == default_out_name),
+                None,
+            )
+            if output_dev is None:
+                # Fallback：直接使用系統預設輸出索引
+                output_dev = sd.default.device[1]
+            dev_info = sd.query_devices(output_dev)
+
+        self._native_sr = int(dev_info["default_samplerate"])
+        channels = max(int(dev_info.get("max_output_channels", 0)), 1)
+        self._stream = sd.InputStream(
+            samplerate=self._native_sr,
+            channels=channels,
+            dtype="float32",
+            blocksize=int(self._native_sr * 0.05),  # 50ms 固定 buffer
+            device=output_dev,
+            extra_settings=sd.WasapiSettings(loopback=True),
+            callback=self._sd_callback,
+        )
 
     def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """音訊執行緒 callback：只做最輕量的 enqueue，不做任何阻塞操作。"""
@@ -727,7 +788,9 @@ def main() -> None:
     parser.add_argument("--source", choices=["monitor", "mic"], default="monitor",
                         help="Audio source: monitor（系統音訊）or mic（麥克風）")
     parser.add_argument("--monitor-device", default=MonitorAudioSource.DEFAULT_DEVICE,
-                        help="PulseAudio monitor source name（用 --list-devices 查詢）")
+                        help="音訊擷取裝置：Linux=PulseAudio monitor source 名稱；"
+                             "Windows=WASAPI 輸出裝置名稱或索引（None=自動偵測預設輸出）。"
+                             "用 --list-devices 查詢可用裝置")
     parser.add_argument("--mic-device", default=None,
                         help="麥克風裝置名稱或索引（None = 系統預設麥克風）")
     parser.add_argument("--direction", choices=["en→zh", "zh→en"], default="en→zh",
