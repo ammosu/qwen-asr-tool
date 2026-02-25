@@ -553,8 +553,12 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     """
     import onnxruntime as ort
     from pathlib import Path
+    import opencc
 
     os.environ.pop("DISPLAY", None)
+
+    # 簡體→台灣繁體轉換器（s2twp 包含詞彙替換，如「軟件→軟體」）
+    _s2tw = opencc.OpenCC("s2twp")
 
     current_original = ""
 
@@ -672,11 +676,22 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
             print(f"[VAD fatal error] {e}", flush=True)
             import traceback; traceback.print_exc()
 
-    def _parse_asr_text(raw: str) -> str:
-        """剝除 'language XXX<asr_text>' 前綴。"""
+    def _parse_asr_result(raw: str) -> tuple[str, str]:
+        """剝除 'language XXX<asr_text>' 前綴，回傳 (language, text)。"""
+        language = ""
+        if raw.startswith("language ") and "<asr_text>" in raw:
+            header, text = raw.split("<asr_text>", 1)
+            language = header.removeprefix("language ").strip()
+            return language, text.strip()
         if "<asr_text>" in raw:
-            raw = raw.split("<asr_text>", 1)[1]
-        return raw.strip()
+            return "", raw.split("<asr_text>", 1)[1].strip()
+        return "", raw.strip()
+
+    def _to_traditional(text: str, language: str) -> str:
+        """若語言為中文，將簡體轉成台灣繁體。"""
+        if language and "chinese" in language.lower():
+            return _s2tw.convert(text)
+        return text
 
     def asr_loop() -> None:
         """
@@ -705,12 +720,17 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
             try:
                 asr.start()
                 result = asr.push_chunk(audio)
-                intermediate_text = _parse_asr_text(result.get("text", ""))
+                inter_lang, intermediate_text = _parse_asr_result(result.get("text", ""))
                 try:
                     fin = asr.finish()
-                    text = _parse_asr_text(fin.get("text", "")) or intermediate_text
+                    fin_lang, fin_text = _parse_asr_result(fin.get("text", ""))
+                    language = fin_lang or inter_lang
+                    text = fin_text or intermediate_text
                 except Exception:
+                    language = inter_lang
                     text = intermediate_text
+
+                text = _to_traditional(text, language)
 
                 if not text:
                     continue
