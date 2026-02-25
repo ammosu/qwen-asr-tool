@@ -45,7 +45,7 @@ class ASRClient:
             f"{self.base_url}/api/transcribe",
             data=audio_float32.tobytes(),
             headers={"Content-Type": "application/octet-stream"},
-            timeout=120,
+            timeout=20,
         )
         r.raise_for_status()
         return r.json()
@@ -757,7 +757,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     VAD_CHUNK = 576               # 36ms @ 16kHz
     VAD_THRESHOLD = 0.5
     RT_SILENCE_CHUNKS = 22        # 0.8s - 靜音後觸發轉錄
-    RT_MAX_BUFFER_CHUNKS = 277    # 10s  - 強制 flush（one-shot 是 O(n)，可放大）
+    RT_MAX_BUFFER_CHUNKS = 83     # 3s   - 強制 flush（one-shot 是 O(n)，可放大）
 
     # 載入 VAD 模型
     _vad_model_path = Path(__file__).parent / "silero_vad_v6.onnx"
@@ -815,13 +815,17 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                         sil_cnt += 1
                         if sil_cnt >= RT_SILENCE_CHUNKS:
                             # 靜音 0.8s：送出整段語音，保留 h/c 以免下句開頭被漏偵測
-                            _speech_q.put(np.concatenate(buf))
+                            seg = np.concatenate(buf)
+                            print(f"[VAD] flush silence {len(seg)/TARGET_SR:.2f}s", flush=True)
+                            _speech_q.put(seg)
                             buf = []
                             sil_cnt = 0
 
                     # Max buffer 10s：強制送出，保留 h/c
                     if len(buf) >= RT_MAX_BUFFER_CHUNKS:
-                        _speech_q.put(np.concatenate(buf))
+                        seg = np.concatenate(buf)
+                        print(f"[VAD] flush max {len(seg)/TARGET_SR:.2f}s", flush=True)
+                        _speech_q.put(seg)
                         buf = []
                         sil_cnt = 0
 
@@ -842,6 +846,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     def asr_loop() -> None:
         """ASR 執行緒：one-shot 轉錄，收到整段語音就直接送 server 辨識。"""
         nonlocal current_original
+        print("[ASR] thread started", flush=True)
 
         while not _stop_event.is_set():
             try:
@@ -856,6 +861,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                 result = asr.transcribe(audio)
                 language = result.get("language", "")
                 text = _to_traditional(result.get("text", ""), language)
+                print(f"[ASR] lang={language!r} text={text!r} same={text == current_original}", flush=True)
 
                 if text and text != current_original:
                     current_original = text
@@ -864,6 +870,17 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
 
             except Exception as e:
                 print(f"[Worker ASR error] {e}", flush=True)
+                # timeout 後清空積壓的舊 chunk，避免 server 持續過載
+                if "timed out" in str(e).lower():
+                    drained = 0
+                    while not _speech_q.empty():
+                        try:
+                            _speech_q.get_nowait()
+                            drained += 1
+                        except queue.Empty:
+                            break
+                    if drained:
+                        print(f"[ASR] Cleared {drained} stale chunks after timeout", flush=True)
 
     vad_thread = threading.Thread(target=vad_loop, daemon=True, name="vad-thread")
     asr_thread = threading.Thread(target=asr_loop, daemon=True, name="asr-thread")
