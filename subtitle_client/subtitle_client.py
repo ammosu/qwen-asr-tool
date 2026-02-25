@@ -216,8 +216,9 @@ class SubtitleOverlay:
     EN_FONT = ("Arial", 14)
     ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
 
-    def __init__(self, screen_index: int = 0, on_toggle_direction=None):
+    def __init__(self, screen_index: int = 0, on_toggle_direction=None, on_switch_source=None):
         self._on_toggle_direction = on_toggle_direction
+        self._on_switch_source = on_switch_source
 
         self._root = tk.Tk()
 
@@ -249,6 +250,18 @@ class SubtitleOverlay:
             relief="flat",
             padx=8,
             command=self._toggle_direction,
+        ).pack(side="left", padx=4, pady=2)
+
+        self._src_btn_var = tk.StringVar(value="[🔊 MON]")
+        tk.Button(
+            toolbar,
+            textvariable=self._src_btn_var,
+            font=("Arial", 10),
+            fg=self.BTN_COLOR,
+            bg=self.BTN_BG,
+            relief="flat",
+            padx=8,
+            command=self._switch_source,
         ).pack(side="left", padx=4, pady=2)
 
         tk.Button(
@@ -302,6 +315,14 @@ class SubtitleOverlay:
     def update_direction_label(self, direction: str):
         label = f"[{direction} ⇄]"
         self._root.after(0, lambda: self._dir_btn_var.set(label))
+
+    def _switch_source(self):
+        if self._on_switch_source:
+            self._on_switch_source()
+
+    def update_source_label(self, source: str):
+        label = "[🎤 MIC]" if source == "mic" else "[🔊 MON]"
+        self._root.after(0, lambda: self._src_btn_var.set(label))
 
     def set_text(self, original: str = "", translated: str = ""):
         """從任意執行緒安全地更新字幕（用 after() 排程到主執行緒）。"""
@@ -448,16 +469,69 @@ class MonitorAudioSource(AudioSource):
 
 
 class MicrophoneAudioSource(AudioSource):
-    """麥克風音訊來源（預留，尚未實作）。"""
+    """麥克風音訊來源。"""
 
     def __init__(self, device=None):
-        self._device = device
+        self._device = device  # None = 系統預設麥克風
+        self._stream = None
+        self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._native_sr: int = 0
+        self._callback: Callable[[np.ndarray], None] | None = None
+        self._queue: queue.Queue = queue.Queue()
+        self._running: bool = False
+        self._consumer_thread: threading.Thread | None = None
 
     def start(self, callback: Callable[[np.ndarray], None]) -> None:
-        raise NotImplementedError("MicrophoneAudioSource 尚未實作")
+        if self._stream is not None:
+            raise RuntimeError("MicrophoneAudioSource is already running; call stop() first.")
+        import sounddevice as sd
+        dev_info = sd.query_devices(self._device, kind="input")
+        self._native_sr = int(dev_info["default_samplerate"])
+        self._callback = callback
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._running = True
+        self._consumer_thread = threading.Thread(target=self._consumer, daemon=True)
+        self._consumer_thread.start()
+        self._stream = sd.InputStream(
+            samplerate=self._native_sr,
+            channels=1,
+            dtype="float32",
+            blocksize=int(self._native_sr * 0.05),
+            device=self._device,
+            callback=self._sd_callback,
+        )
+        self._stream.start()
+
+    def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        if status:
+            print(f"[Audio] {status}")
+        self._queue.put(indata[:, 0].copy())
+
+    def _consumer(self) -> None:
+        while self._running:
+            try:
+                raw = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            target_len = int(len(raw) * TARGET_SR / self._native_sr)
+            resampled = signal.resample(raw, target_len).astype(np.float32)
+            self._buf = np.concatenate([self._buf, resampled])
+            while len(self._buf) >= CHUNK_SAMPLES:
+                chunk = self._buf[:CHUNK_SAMPLES].copy()
+                self._buf = self._buf[CHUNK_SAMPLES:]
+                if self._callback:
+                    self._callback(chunk)
 
     def stop(self) -> None:
-        pass
+        self._running = False
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+        if self._consumer_thread:
+            self._consumer_thread.join(timeout=1.0)
+            self._consumer_thread = None
+        self._buf = np.zeros(0, dtype=np.float32)
 
 # ---------------------------------------------------------------------------
 # Worker Process（音訊 + ASR + 翻譯，無 X11）
@@ -497,7 +571,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     if cfg["source"] == "monitor":
         audio_source = MonitorAudioSource(device=cfg["monitor_device"])
     else:
-        audio_source = MicrophoneAudioSource()
+        audio_source = MicrophoneAudioSource(device=cfg.get("mic_device"))
 
     asr = ASRClient(cfg["asr_server"])
 
@@ -506,7 +580,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     VAD_THRESHOLD = 0.5
     RT_SILENCE_CHUNKS = 22        # 0.8s - 短靜音：probe 句末
     RT_LONG_SILENCE_CHUNKS = 55   # 2s   - 長靜音：強制 flush
-    RT_MAX_BUFFER_CHUNKS = 55     # 2s   - 強制 flush（限制單次 push_chunk ≤ 2s，避免 server timeout）
+    RT_MAX_BUFFER_CHUNKS = 83     # 3s   - 強制 flush（限制單次 push_chunk ≤ 3s，避免 server timeout）
 
     # 句末符號（ASR 回傳英文標點或中文標點皆可）
     SENTENCE_END_CHARS = frozenset('.?!。？！…')
@@ -677,6 +751,16 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                 if cmd == "toggle":
                     new_dir = debouncer.toggle_direction()
                     text_q.put({"direction": new_dir})
+                elif cmd == "switch_source":
+                    audio_source.stop()
+                    if isinstance(audio_source, MonitorAudioSource):
+                        audio_source = MicrophoneAudioSource(device=cfg.get("mic_device"))
+                        src_name = "mic"
+                    else:
+                        audio_source = MonitorAudioSource(device=cfg["monitor_device"])
+                        src_name = "monitor"
+                    audio_source.start(on_chunk)
+                    text_q.put({"source": src_name})
                 elif cmd == "stop":
                     break
             else:
@@ -714,6 +798,8 @@ def main() -> None:
                         help="Audio source: monitor（系統音訊）or mic（麥克風）")
     parser.add_argument("--monitor-device", default=MonitorAudioSource.DEFAULT_DEVICE,
                         help="PulseAudio monitor source name（用 --list-devices 查詢）")
+    parser.add_argument("--mic-device", default=None,
+                        help="麥克風裝置名稱或索引（None = 系統預設麥克風）")
     parser.add_argument("--direction", choices=["en→zh", "zh→en"], default="en→zh",
                         help="Initial translation direction")
     args = parser.parse_args()
@@ -732,6 +818,7 @@ def main() -> None:
         "translation_model": args.translation_model,
         "source": args.source,
         "monitor_device": args.monitor_device,
+        "mic_device": args.mic_device,
         "direction": args.direction,
     }
 
@@ -747,8 +834,15 @@ def main() -> None:
         cmd_q.put("toggle")
         return current_direction[0]
 
+    def on_switch_source() -> None:
+        cmd_q.put("switch_source")
+
     # 先建立 tkinter（在 fork 之前完成 X11 連線，child 繼承 fd 但立即移除 DISPLAY）
-    overlay = SubtitleOverlay(screen_index=args.screen, on_toggle_direction=on_toggle)
+    overlay = SubtitleOverlay(
+        screen_index=args.screen,
+        on_toggle_direction=on_toggle,
+        on_switch_source=on_switch_source,
+    )
     overlay.update_direction_label(args.direction)
 
     # tkinter 初始化後才 fork worker（child 不使用 X11）
@@ -764,6 +858,8 @@ def main() -> None:
             msg = text_q.get()
             if "direction" in msg:
                 overlay.update_direction_label(msg["direction"])
+            elif "source" in msg:
+                overlay.update_source_label(msg["source"])
             else:
                 overlay.set_text(
                     original=msg.get("original", ""),
