@@ -185,14 +185,17 @@ class SubtitleOverlay:
     """
 
     TOOLBAR_HEIGHT = 28
-    WINDOW_HEIGHT = 148         # 原 120 + TOOLBAR_HEIGHT
-    TOOLBAR_BG = "#1a1a1a"
+    WINDOW_HEIGHT = 120
+    WINDOW_WIDTH = 900
+    RESIZE_SIZE = 16
+    TOOLBAR_BG = "#222222"
     BTN_COLOR = "#ffffff"
     BTN_BG = "#333333"
     BG_COLOR = "#000000"
-    EN_COLOR = "#888888"
+    EN_COLOR = "#dddddd"
     ZH_COLOR = "#ffffff"
-    EN_FONT = ("Arial", 14)
+    SHADOW_COLOR = "#111111"
+    EN_FONT = ("Arial", 15)
     ZH_FONT = ("Microsoft JhengHei", 22, "bold")  # Windows 繁中字體
 
     def __init__(self, screen_index: int = 0, on_toggle_direction=None, on_switch_source=None):
@@ -202,22 +205,39 @@ class SubtitleOverlay:
         self._root = tk.Tk()
 
         # 用 tkinter 取螢幕尺寸（不依賴 screeninfo）
-        self._width = self._root.winfo_screenwidth()
-        screen_height = self._root.winfo_screenheight()
-        self._x = 0
-        self._y = screen_height - self.WINDOW_HEIGHT
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        self._x = (screen_w - self.WINDOW_WIDTH) // 2
+        self._y = screen_h - self.WINDOW_HEIGHT - 40
 
         self._root.overrideredirect(True)
         self._root.wm_attributes("-topmost", True)
-        self._root.wm_attributes("-alpha", 0.85)
+        self._root.wm_attributes("-transparentcolor", self.BG_COLOR)
         self._root.configure(bg=self.BG_COLOR)
         self._root.geometry(
-            f"{self._width}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
+            f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
         )
 
-        # ── 工具列 ──
+        # ── Canvas (created first so toolbar overlays it) ──
+        self._canvas = tk.Canvas(
+            self._root,
+            bg=self.BG_COLOR,
+            highlightthickness=0,
+        )
+        self._canvas.pack(fill="both", expand=True)
+        self._canvas.bind("<Configure>", lambda e: self._redraw_text())
+        self._canvas.bind("<ButtonPress-1>", self._start_drag)
+        self._canvas.bind("<B1-Motion>", self._do_drag)
+
+        self._canvas.tag_bind("resize_handle", "<ButtonPress-1>",   self._start_resize)
+        self._canvas.tag_bind("resize_handle", "<B1-Motion>",       self._do_resize)
+        self._canvas.tag_bind("resize_handle", "<ButtonRelease-1>", self._stop_resize)
+
+        # ── 工具列 (created after canvas so it has higher z-order) ──
         toolbar = tk.Frame(self._root, bg=self.TOOLBAR_BG, height=self.TOOLBAR_HEIGHT)
-        toolbar.pack(fill="x", side="top")
+        toolbar.place(x=0, y=0, relwidth=1.0, height=self.TOOLBAR_HEIGHT)
+        toolbar.place_forget()
+        self._toolbar = toolbar
 
         self._dir_btn_var = tk.StringVar(value="[EN→ZH ⇄]")
         tk.Button(
@@ -254,29 +274,18 @@ class SubtitleOverlay:
             command=self._do_close,
         ).pack(side="right", padx=4, pady=2)
 
-        # 英文行
-        self._en_var = tk.StringVar()
-        tk.Label(
-            self._root,
-            textvariable=self._en_var,
-            font=self.EN_FONT,
-            fg=self.EN_COLOR,
-            bg=self.BG_COLOR,
-            anchor="w",
-            padx=20,
-        ).pack(fill="x", pady=(10, 0))
+        self._toolbar_hide_id = None
 
-        # 中文行
-        self._zh_var = tk.StringVar()
-        tk.Label(
-            self._root,
-            textvariable=self._zh_var,
-            font=self.ZH_FONT,
-            fg=self.ZH_COLOR,
-            bg=self.BG_COLOR,
-            anchor="w",
-            padx=20,
-        ).pack(fill="x")
+        self._root.bind("<Enter>", self._show_toolbar)
+        self._root.bind("<Leave>", self._hide_toolbar)
+        self._toolbar.bind("<Enter>", self._show_toolbar)
+        self._toolbar.bind("<Leave>", self._hide_toolbar)
+
+        self._en_str = ""
+        self._zh_str = ""
+        self._drag_x = 0
+        self._drag_y = 0
+        self._resize_start = None   # (mouse_x, mouse_y, win_w, win_h)
 
         self._root.bind("<Escape>", lambda e: self._do_close())
         self._root.bind("<F9>", lambda e: self._toggle_direction())
@@ -285,6 +294,61 @@ class SubtitleOverlay:
     def _do_close(self):
         """關閉視窗。"""
         self._root.destroy()
+
+    def _show_toolbar(self, event=None):
+        if self._toolbar_hide_id:
+            self._root.after_cancel(self._toolbar_hide_id)
+            self._toolbar_hide_id = None
+        self._toolbar.place(x=0, y=0, relwidth=1.0, height=self.TOOLBAR_HEIGHT)
+        self._toolbar.lift()
+
+    def _hide_toolbar(self, event=None):
+        self._toolbar_hide_id = self._root.after(
+            400, lambda: self._toolbar.place_forget()
+        )
+
+    def _start_drag(self, event):
+        self._drag_x = event.x_root - self._root.winfo_x()
+        self._drag_y = event.y_root - self._root.winfo_y()
+
+    def _do_drag(self, event):
+        nx = event.x_root - self._drag_x
+        ny = event.y_root - self._drag_y
+        self._root.geometry(f"+{nx}+{ny}")
+
+    def _draw_resize_handle(self):
+        """Draw a small triangle at bottom-right of canvas for resizing."""
+        self._canvas.delete("resize_handle")
+        w = self._canvas.winfo_width() or self._root.winfo_width()
+        h = self._canvas.winfo_height() or self._root.winfo_height()
+        s = self.RESIZE_SIZE
+        self._canvas.create_polygon(
+            w, h - s,
+            w - s, h,
+            w, h,
+            fill="#888888", outline="", tags="resize_handle",
+        )
+
+    def _start_resize(self, event):
+        self._resize_start = (
+            event.x_root, event.y_root,
+            self._root.winfo_width(), self._root.winfo_height(),
+        )
+        return "break"
+
+    def _do_resize(self, event):
+        if not self._resize_start:
+            return "break"
+        mx0, my0, w0, h0 = self._resize_start
+        new_w = max(300, w0 + event.x_root - mx0)
+        new_h = max(80,  h0 + event.y_root - my0)
+        x = self._root.winfo_x()
+        y = self._root.winfo_y()
+        self._root.geometry(f"{new_w}x{new_h}+{x}+{y}")
+        return "break"
+
+    def _stop_resize(self, event):
+        self._resize_start = None
 
     def _toggle_direction(self):
         if self._on_toggle_direction:
@@ -306,9 +370,32 @@ class SubtitleOverlay:
     def set_text(self, original: str = "", translated: str = ""):
         """從任意執行緒安全地更新字幕（用 after() 排程到主執行緒）。"""
         def _update():
-            self._en_var.set(original[-120:] if len(original) > 120 else original)
-            self._zh_var.set(translated[-60:] if len(translated) > 60 else translated)
+            self._en_str = original[-120:] if len(original) > 120 else original
+            self._zh_str = translated[-60:] if len(translated) > 60 else translated
+            self._redraw_text()
         self._root.after(0, _update)
+
+    def _redraw_text(self):
+        """Clear canvas and re-draw subtitle text with shadow."""
+        self._canvas.delete("text")
+
+        w = self._canvas.winfo_width() or self._root.winfo_width()
+
+        # EN line — 20px from left, 12px from top of canvas area
+        ex, ey = 20, 12
+        self._canvas.create_text(ex+2, ey+2, text=self._en_str, fill=self.SHADOW_COLOR,
+                                 font=self.EN_FONT, anchor="nw", width=w-40, tags="text")
+        self._canvas.create_text(ex,   ey,   text=self._en_str, fill=self.EN_COLOR,
+                                 font=self.EN_FONT, anchor="nw", width=w-40, tags="text")
+
+        # ZH line — below EN (~30px gap covers Arial-15 line height)
+        zy = ey + 30
+        self._canvas.create_text(ex+2, zy+2, text=self._zh_str, fill=self.SHADOW_COLOR,
+                                 font=self.ZH_FONT, anchor="nw", width=w-40, tags="text")
+        self._canvas.create_text(ex,   zy,   text=self._zh_str, fill=self.ZH_COLOR,
+                                 font=self.ZH_FONT, anchor="nw", width=w-40, tags="text")
+
+        self._draw_resize_handle()
 
     def run(self):
         """啟動 tkinter mainloop（阻塞，必須在主執行緒呼叫）。"""
