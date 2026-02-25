@@ -30,43 +30,21 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 
 class ASRClient:
-    """HTTP client for Qwen3-ASR streaming server."""
+    """HTTP client for Qwen3-ASR server."""
 
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.session_id: str | None = None
 
-    def start(self):
-        """建立新的 streaming session。"""
-        r = requests.post(f"{self.base_url}/api/start", timeout=10)
-        r.raise_for_status()
-        self.session_id = r.json()["session_id"]
-
-    def push_chunk(self, audio_float32: np.ndarray) -> dict:
+    def transcribe(self, audio_float32: np.ndarray) -> dict:
         """
-        送出一段 16kHz float32 音訊，回傳 {"language": str, "text": str}。
+        One-shot 轉錄：送出整段 16kHz float32 音訊，回傳 {"language": str, "text": str}。
         audio_float32: shape (N,), dtype float32
         """
-        assert self.session_id, "Call start() first"
         r = requests.post(
-            f"{self.base_url}/api/chunk",
-            params={"session_id": self.session_id},
+            f"{self.base_url}/api/transcribe",
             data=audio_float32.tobytes(),
             headers={"Content-Type": "application/octet-stream"},
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def finish(self) -> dict:
-        """結束 session，回傳最終結果。"""
-        assert self.session_id, "Call start() first"
-        sid = self.session_id
-        self.session_id = None
-        r = requests.post(
-            f"{self.base_url}/api/finish",
-            params={"session_id": sid},
-            timeout=60,
+            timeout=120,
         )
         r.raise_for_status()
         return r.json()
@@ -582,12 +560,8 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     # Silero VAD 常數（v6 模型）
     VAD_CHUNK = 576               # 36ms @ 16kHz
     VAD_THRESHOLD = 0.5
-    RT_SILENCE_CHUNKS = 22        # 0.8s - 短靜音：probe 句末
-    RT_LONG_SILENCE_CHUNKS = 55   # 2s   - 長靜音：強制 flush
-    RT_MAX_BUFFER_CHUNKS = 83     # 3s   - 強制 flush（限制單次 push_chunk ≤ 3s，避免 server timeout）
-
-    # 句末符號（ASR 回傳英文標點或中文標點皆可）
-    SENTENCE_END_CHARS = frozenset('.?!。？！…')
+    RT_SILENCE_CHUNKS = 22        # 0.8s - 靜音後觸發轉錄
+    RT_MAX_BUFFER_CHUNKS = 277    # 10s  - 強制 flush（one-shot 是 O(n)，可放大）
 
     # 載入 VAD 模型
     _vad_model_path = Path(__file__).parent / "silero_vad_v6.onnx"
@@ -606,17 +580,14 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
 
     def vad_loop() -> None:
         """
-        VAD 執行緒：兩段式靜音偵測。
+        VAD 執行緒：靜音偵測。
 
-        短靜音（0.8s）→ 送 (buf, "probe")，由 asr_loop 決定是否句末
-        長靜音（2s）  → 送 (empty, "force")，強制顯示
-        max buffer   → 送 (buf, "force")，強制顯示
+        語音結束（靜音 ≥ 0.8s）或 buffer 達 10s 上限時，把整段語音送到 _speech_q。
         """
         h = np.zeros((1, 1, 128), dtype=np.float32)
         c = np.zeros((1, 1, 128), dtype=np.float32)
         buf: list[np.ndarray] = []
         sil_cnt = 0
-        probed = False   # 是否已送出 probe（等待 long silence 或新語音）
         leftover = np.zeros(0, dtype=np.float32)
 
         try:
@@ -643,49 +614,28 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                     if prob >= VAD_THRESHOLD:
                         buf.append(chunk)
                         sil_cnt = 0
-                        probed = False
-                    elif buf or sil_cnt > 0:
-                        if buf:
-                            buf.append(chunk)
+                    elif buf:
+                        buf.append(chunk)
                         sil_cnt += 1
-
-                        if not probed and sil_cnt >= RT_SILENCE_CHUNKS:
-                            # 短靜音：送 probe，清空 buf 但保留 session
-                            probe_audio = np.concatenate(buf) if buf else np.zeros(0, dtype=np.float32)
-                            _speech_q.put((probe_audio, "probe"))
+                        if sil_cnt >= RT_SILENCE_CHUNKS:
+                            # 靜音 0.8s：送出整段語音
+                            _speech_q.put(np.concatenate(buf))
                             buf = []
-                            probed = True
-                        elif probed and sil_cnt >= RT_LONG_SILENCE_CHUNKS:
-                            # 長靜音：強制 flush
-                            _speech_q.put((np.zeros(0, dtype=np.float32), "force"))
                             sil_cnt = 0
-                            probed = False
                             h = np.zeros((1, 1, 128), dtype=np.float32)
                             c = np.zeros((1, 1, 128), dtype=np.float32)
 
-                    # Max buffer：強制 flush
+                    # Max buffer 10s：強制送出
                     if len(buf) >= RT_MAX_BUFFER_CHUNKS:
-                        _speech_q.put((np.concatenate(buf), "force"))
+                        _speech_q.put(np.concatenate(buf))
                         buf = []
                         sil_cnt = 0
-                        probed = False
                         h = np.zeros((1, 1, 128), dtype=np.float32)
                         c = np.zeros((1, 1, 128), dtype=np.float32)
 
         except Exception as e:
             print(f"[VAD fatal error] {e}", flush=True)
             import traceback; traceback.print_exc()
-
-    def _parse_asr_result(raw: str) -> tuple[str, str]:
-        """剝除 'language XXX<asr_text>' 前綴，回傳 (language, text)。"""
-        language = ""
-        if raw.startswith("language ") and "<asr_text>" in raw:
-            header, text = raw.split("<asr_text>", 1)
-            language = header.removeprefix("language ").strip()
-            return language, text.strip()
-        if "<asr_text>" in raw:
-            return "", raw.split("<asr_text>", 1)[1].strip()
-        return "", raw.strip()
 
     def _to_traditional(text: str, language: str) -> str:
         """若語言為中文（語言標籤或文字內含 CJK），將簡體轉成台灣繁體。"""
@@ -698,23 +648,12 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
         return text
 
     def asr_loop() -> None:
-        """
-        ASR 執行緒：句子組合器（sentence assembler）。
-
-        每個 2s 片段辨識後累積到 assembled_parts。
-        只有當組合後文字以句末符號結尾，或已累積 ≥ MAX_ASSEMBLE_PARTS 個片段時，
-        才顯示組合後的完整句子。
-
-        probe  + 句末符號  → 立即顯示組合結果
-        force              → 累積到組合器，句末才顯示（或片段數達上限）
-        """
+        """ASR 執行緒：one-shot 轉錄，收到整段語音就直接送 server 辨識。"""
         nonlocal current_original
-        assembled_parts: list[str] = []   # 等待組合的片段
-        MAX_ASSEMBLE_PARTS = 3            # 最多累積 ~6s 的片段再強制顯示
 
         while not _stop_event.is_set():
             try:
-                audio, event = _speech_q.get(timeout=0.5)
+                audio = _speech_q.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -722,43 +661,18 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                 continue
 
             try:
-                asr.start()
-                result = asr.push_chunk(audio)
-                inter_lang, intermediate_text = _parse_asr_result(result.get("text", ""))
-                try:
-                    fin = asr.finish()
-                    fin_lang, fin_text = _parse_asr_result(fin.get("text", ""))
-                    language = fin_lang or inter_lang
-                    text = fin_text or intermediate_text
-                except Exception:
-                    language = inter_lang
-                    text = intermediate_text
-
+                result = asr.transcribe(audio)
+                language = result.get("language", "")
+                text = result.get("text", "")
                 text = _to_traditional(text, language)
 
-                if not text:
-                    continue
-
-                assembled_parts.append(text)
-                assembled = " ".join(assembled_parts)
-
-                # 判斷是否顯示：句末符號 OR 達到片段上限
-                sentence_done = assembled[-1] in SENTENCE_END_CHARS
-                force_show = len(assembled_parts) >= MAX_ASSEMBLE_PARTS
-
-                if sentence_done or force_show or event == "probe":
-                    if assembled != current_original:
-                        current_original = assembled
-                        text_q.put({"original": assembled, "translated": ""})
-                        # debouncer.update(assembled)  # 翻譯暫時關閉
-                    assembled_parts = []
+                if text and text != current_original:
+                    current_original = text
+                    text_q.put({"original": text, "translated": ""})
+                    # debouncer.update(text)  # 翻譯暫時關閉
 
             except Exception as e:
                 print(f"[Worker ASR error] {e}", flush=True)
-                try:
-                    asr.finish()
-                except Exception:
-                    pass
 
     vad_thread = threading.Thread(target=vad_loop, daemon=True, name="vad-thread")
     asr_thread = threading.Thread(target=asr_loop, daemon=True, name="asr-thread")
@@ -795,10 +709,6 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
         debouncer.shutdown()
         vad_thread.join(timeout=3)
         asr_thread.join(timeout=5)
-        try:
-            asr.finish()
-        except Exception:
-            pass
         print("[Worker] Stopped.", flush=True)
 
 

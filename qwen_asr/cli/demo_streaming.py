@@ -469,6 +469,25 @@ def api_finish():
     return jsonify(out)
 
 
+@app.post("/api/transcribe")
+def api_transcribe():
+    """One-shot transcription: POST raw float32 PCM → {"language": str, "text": str}."""
+    if request.mimetype != "application/octet-stream":
+        return jsonify({"error": "expect application/octet-stream"}), 400
+
+    raw = request.get_data(cache=False)
+    if len(raw) % 4 != 0:
+        return jsonify({"error": "float32 bytes length not multiple of 4"}), 400
+
+    wav = np.frombuffer(raw, dtype=np.float32).reshape(-1)
+    results = asr.transcribe([(wav, 16000)])
+    r = results[0] if results else type("R", (), {"language": "", "text": ""})()
+    return jsonify({
+        "language": getattr(r, "language", "") or "",
+        "text": getattr(r, "text", "") or "",
+    })
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Qwen3-ASR Streaming Web Demo (vLLM backend)")
     p.add_argument("--asr-model-path", default="Qwen/Qwen3-ASR-1.7B", help="Model name or local path")
