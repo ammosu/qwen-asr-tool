@@ -161,9 +161,10 @@ class TranslationDebouncer:
                 temperature=0.1,
             )
             translated = response.choices[0].message.content.strip()
+            print(f"[Translation] {translated}", flush=True)
             self.callback(translated)
         except Exception as e:
-            print(f"[Translation error] {e}")
+            print(f"[Translation error] {e}", flush=True)
 
     def shutdown(self):
         with self._lock:
@@ -186,8 +187,8 @@ class SubtitleOverlay:
 
     TOOLBAR_HEIGHT = 28
     DRAG_BAR_HEIGHT = 14
-    WINDOW_HEIGHT = 134          # DRAG_BAR_HEIGHT + 120 (字幕區)
-    WINDOW_WIDTH = 900
+    WINDOW_HEIGHT = 160          # DRAG_BAR_HEIGHT + 146 (字幕區)
+    WINDOW_WIDTH = 900           # 預設值，__init__ 會依螢幕動態覆蓋
     RESIZE_SIZE = 16
     TOOLBAR_BG = "#222222"
     DRAG_BAR_COLOR = "#2a2a2a"   # 深灰，非純黑（不會被 transparentcolor 穿透）
@@ -209,8 +210,11 @@ class SubtitleOverlay:
         # 用 tkinter 取螢幕尺寸（不依賴 screeninfo）
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
-        self._x = (screen_w - self.WINDOW_WIDTH) // 2
-        self._y = screen_h - self.WINDOW_HEIGHT - 40
+        # 視窗寬度為螢幕的 80%（最小 900），高度固定
+        self._win_w = max(900, int(screen_w * 0.80))
+        self._win_h = self.WINDOW_HEIGHT
+        self._x = (screen_w - self._win_w) // 2
+        self._y = screen_h - self._win_h - 40
 
         self._root.overrideredirect(True)
         self._root.wm_attributes("-topmost", True)
@@ -220,7 +224,7 @@ class SubtitleOverlay:
             self._root.wm_attributes("-alpha", 0.85)
         self._root.configure(bg=self.BG_COLOR)
         self._root.geometry(
-            f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
+            f"{self._win_w}x{self._win_h}+{self._x}+{self._y}"
         )
 
         # ── 拖拉條（常駐頂部，提供拖拉控點） ──
@@ -756,8 +760,8 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
     # Silero VAD 常數（v6 模型）
     VAD_CHUNK = 576               # 36ms @ 16kHz
     VAD_THRESHOLD = 0.5
-    RT_SILENCE_CHUNKS = 22        # 0.8s - 靜音後觸發轉錄
-    RT_MAX_BUFFER_CHUNKS = 83     # 3s   - 強制 flush（one-shot 是 O(n)，可放大）
+    RT_SILENCE_CHUNKS = 22        # 0.8s - 靜音後觸發轉錄（同 QwenASRMiniTool）
+    RT_MAX_BUFFER_CHUNKS = 277    # 10s  - 強制 flush（HTTP timeout 20s 限制，取一半）
 
     # 載入 VAD 模型
     _vad_model_path = Path(__file__).parent / "silero_vad_v6.onnx"
@@ -866,7 +870,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                 if text and text != current_original:
                     current_original = text
                     text_q.put({"original": text, "translated": ""})
-                    # debouncer.update(text)  # 翻譯暫時關閉
+                    debouncer.update(text)  # 翻譯開啟
 
             except Exception as e:
                 print(f"[Worker ASR error] {e}", flush=True)
@@ -997,6 +1001,8 @@ def main() -> None:
     worker.start()
 
     # 用 tkinter after() 輪詢 text_q（全在主執行緒，零 X11 競爭）
+    _last_translated = [""]  # 保留上一筆翻譯，直到新翻譯到來才替換
+
     def poll() -> None:
         while not text_q.empty():
             msg = text_q.get()
@@ -1005,9 +1011,12 @@ def main() -> None:
             elif "source" in msg:
                 overlay.update_source_label(msg["source"])
             else:
+                translated = msg.get("translated", "")
+                if translated:
+                    _last_translated[0] = translated
                 overlay.set_text(
                     original=msg.get("original", ""),
-                    translated=msg.get("translated", ""),
+                    translated=_last_translated[0],
                 )
         overlay._root.after(50, poll)
 
