@@ -189,7 +189,7 @@ class SubtitleOverlay:
     DRAG_BAR_HEIGHT = 14
     WINDOW_HEIGHT = 160          # DRAG_BAR_HEIGHT + 146 (字幕區)
     WINDOW_WIDTH = 900           # 預設值，__init__ 會依螢幕動態覆蓋
-    RESIZE_SIZE = 16
+    RESIZE_SIZE = 28
     TOOLBAR_BG = "#222222"
     DRAG_BAR_COLOR = "#2a2a2a"   # 深灰，非純黑（不會被 transparentcolor 穿透）
     BTN_COLOR = "#ffffff"
@@ -249,9 +249,8 @@ class SubtitleOverlay:
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda e: self._redraw_text())
 
-        self._canvas.tag_bind("resize_handle", "<ButtonPress-1>",   self._start_resize)
-        self._canvas.tag_bind("resize_handle", "<B1-Motion>",       self._do_resize)
-        self._canvas.tag_bind("resize_handle", "<ButtonRelease-1>", self._stop_resize)
+        # 按下時記錄起始狀態，motion/release 改綁到 root（拖出三角形後仍持續追蹤）
+        self._canvas.tag_bind("resize_handle", "<ButtonPress-1>", self._start_resize)
 
         # ── 工具列 (created after canvas so it has higher z-order) ──
         toolbar = tk.Frame(self._root, bg=self.TOOLBAR_BG, height=self.TOOLBAR_HEIGHT)
@@ -350,29 +349,37 @@ class SubtitleOverlay:
             w, h - s,
             w - s, h,
             w, h,
-            fill="#888888", outline="", tags="resize_handle",
+            fill="#aaaaaa", outline="", tags="resize_handle",
         )
+        self._canvas.tag_bind("resize_handle", "<Enter>",
+                              lambda e: self._canvas.configure(cursor="sizing"))
+        self._canvas.tag_bind("resize_handle", "<Leave>",
+                              lambda e: self._canvas.configure(cursor=""))
 
     def _start_resize(self, event):
         self._resize_start = (
             event.x_root, event.y_root,
             self._root.winfo_width(), self._root.winfo_height(),
         )
+        # 綁到 root，拖出三角形範圍後仍可持續縮放
+        self._root.bind("<B1-Motion>",       self._do_resize)
+        self._root.bind("<ButtonRelease-1>", self._stop_resize)
         return "break"
 
     def _do_resize(self, event):
         if not self._resize_start:
-            return "break"
+            return
         mx0, my0, w0, h0 = self._resize_start
         new_w = max(300, w0 + event.x_root - mx0)
         new_h = max(80,  h0 + event.y_root - my0)
         x = self._root.winfo_x()
         y = self._root.winfo_y()
         self._root.geometry(f"{new_w}x{new_h}+{x}+{y}")
-        return "break"
 
     def _stop_resize(self, event):
         self._resize_start = None
+        self._root.unbind("<B1-Motion>")
+        self._root.unbind("<ButtonRelease-1>")
 
     def _toggle_direction(self):
         if self._on_toggle_direction:
