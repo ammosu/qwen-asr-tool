@@ -30,6 +30,16 @@ import torch
 from qwen_asr import Qwen3ASRModel
 from scipy.io.wavfile import write as wav_write
 
+try:
+    import opencc as _opencc
+    _s2twp_converter = _opencc.OpenCC("s2twp")
+
+    def _to_traditional_chinese(text: str) -> str:
+        return _s2twp_converter.convert(text)
+except ImportError:
+    def _to_traditional_chinese(text: str) -> str:  # type: ignore[misc]
+        return text
+
 
 def _title_case_display(s: str) -> str:
     s = (s or "").strip()
@@ -430,27 +440,30 @@ def build_demo(
 
             r = results[0]
 
+            detected_lang = getattr(r, "language", "") or ""
+            result_text = _to_traditional_chinese(getattr(r, "text", "") or "")
+
             if has_aligner:
                 ts_payload = None
                 if return_ts:
                     ts_payload = [
                         dict(
-                            text=getattr(t, "text", None),
+                            text=_to_traditional_chinese(getattr(t, "text", None) or ""),
                             start_time=getattr(t, "start_time", None),
                             end_time=getattr(t, "end_time", None),
                         )
                         for t in (getattr(r, "time_stamps", None) or [])
                     ]
                 return (
-                    getattr(r, "language", "") or "",
-                    getattr(r, "text", "") or "",
+                    detected_lang,
+                    result_text,
                     gr.update(value=ts_payload) if return_ts else gr.update(value=None),
                     gr.update(value=""),  # clear html on each transcribe
                 )
             else:
                 return (
-                    getattr(r, "language", "") or "",
-                    getattr(r, "text", "") or "",
+                    detected_lang,
+                    result_text,
                 )
 
         def visualize(audio_upload: Any, timestamps_json: Any):

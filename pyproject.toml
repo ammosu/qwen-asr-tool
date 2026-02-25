@@ -31,6 +31,7 @@ dependencies = [
   "gradio",
   "flask",
   "pytz",
+  "opencc-python-reimplemented",
 ]
 
 [project.optional-dependencies]
