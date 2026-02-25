@@ -185,10 +185,12 @@ class SubtitleOverlay:
     """
 
     TOOLBAR_HEIGHT = 28
-    WINDOW_HEIGHT = 120
+    DRAG_BAR_HEIGHT = 14
+    WINDOW_HEIGHT = 134          # DRAG_BAR_HEIGHT + 120 (字幕區)
     WINDOW_WIDTH = 900
     RESIZE_SIZE = 16
     TOOLBAR_BG = "#222222"
+    DRAG_BAR_COLOR = "#2a2a2a"   # 深灰，非純黑（不會被 transparentcolor 穿透）
     BTN_COLOR = "#ffffff"
     BTN_BG = "#333333"
     BG_COLOR = "#000000"
@@ -218,7 +220,20 @@ class SubtitleOverlay:
             f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
         )
 
-        # ── Canvas (created first so toolbar overlays it) ──
+        # ── 拖拉條（常駐頂部，提供拖拉控點） ──
+        drag_bar = tk.Frame(
+            self._root,
+            bg=self.DRAG_BAR_COLOR,
+            height=self.DRAG_BAR_HEIGHT,
+            cursor="fleur",          # 十字箭頭游標，提示可拖拉
+        )
+        drag_bar.pack(fill="x", side="top")
+        drag_bar.pack_propagate(False)
+        # 拖拉綁定在拖拉條上，不影響字幕區
+        drag_bar.bind("<ButtonPress-1>", self._start_drag)
+        drag_bar.bind("<B1-Motion>", self._do_drag)
+
+        # ── Canvas (created after drag bar, fills remaining space) ──
         self._canvas = tk.Canvas(
             self._root,
             bg=self.BG_COLOR,
@@ -226,8 +241,6 @@ class SubtitleOverlay:
         )
         self._canvas.pack(fill="both", expand=True)
         self._canvas.bind("<Configure>", lambda e: self._redraw_text())
-        self._canvas.bind("<ButtonPress-1>", self._start_drag)
-        self._canvas.bind("<B1-Motion>", self._do_drag)
 
         self._canvas.tag_bind("resize_handle", "<ButtonPress-1>",   self._start_resize)
         self._canvas.tag_bind("resize_handle", "<B1-Motion>",       self._do_resize)
@@ -276,10 +289,14 @@ class SubtitleOverlay:
 
         self._toolbar_hide_id = None
 
-        self._root.bind("<Enter>", self._show_toolbar)
-        self._root.bind("<Leave>", self._hide_toolbar)
+        # 工具列由拖拉條觸發（hover 拖拉條 → 工具列展開並覆蓋拖拉條）
+        # 工具列本身也支援拖拉（按住工具列空白處拖動）
+        drag_bar.bind("<Enter>", self._show_toolbar)
+        drag_bar.bind("<Leave>", self._hide_toolbar)
         self._toolbar.bind("<Enter>", self._show_toolbar)
         self._toolbar.bind("<Leave>", self._hide_toolbar)
+        self._toolbar.bind("<ButtonPress-1>", self._start_drag)
+        self._toolbar.bind("<B1-Motion>", self._do_drag)
 
         self._en_str = ""
         self._zh_str = ""
@@ -380,20 +397,21 @@ class SubtitleOverlay:
         self._canvas.delete("text")
 
         w = self._canvas.winfo_width() or self._root.winfo_width()
+        wrap_w = max(200, w - 40)   # ensure positive wrap width
 
         # EN line — 20px from left, 12px from top of canvas area
         ex, ey = 20, 12
         self._canvas.create_text(ex+2, ey+2, text=self._en_str, fill=self.SHADOW_COLOR,
-                                 font=self.EN_FONT, anchor="nw", width=w-40, tags="text")
+                                 font=self.EN_FONT, anchor="nw", width=wrap_w, tags="text")
         self._canvas.create_text(ex,   ey,   text=self._en_str, fill=self.EN_COLOR,
-                                 font=self.EN_FONT, anchor="nw", width=w-40, tags="text")
+                                 font=self.EN_FONT, anchor="nw", width=wrap_w, tags="text")
 
         # ZH line — below EN (~30px gap covers Arial-15 line height)
         zy = ey + 30
         self._canvas.create_text(ex+2, zy+2, text=self._zh_str, fill=self.SHADOW_COLOR,
-                                 font=self.ZH_FONT, anchor="nw", width=w-40, tags="text")
+                                 font=self.ZH_FONT, anchor="nw", width=wrap_w, tags="text")
         self._canvas.create_text(ex,   zy,   text=self._zh_str, fill=self.ZH_COLOR,
-                                 font=self.ZH_FONT, anchor="nw", width=w-40, tags="text")
+                                 font=self.ZH_FONT, anchor="nw", width=wrap_w, tags="text")
 
         self._draw_resize_handle()
 
@@ -588,17 +606,23 @@ class MonitorAudioSource(AudioSource):
             except queue.Empty:
                 continue
 
-            # resample native_sr → 16kHz（在非即時執行緒中進行）
-            target_len = int(len(raw) * TARGET_SR / self._native_sr)
-            resampled = signal.resample(raw, target_len).astype(np.float32)
-            self._buf = np.concatenate([self._buf, resampled])
+            try:
+                # resample native_sr → 16kHz（在非即時執行緒中進行）
+                target_len = int(len(raw) * TARGET_SR / self._native_sr)
+                if target_len == 0:
+                    continue
+                resampled = signal.resample(raw, target_len).astype(np.float32)
+                self._buf = np.concatenate([self._buf, resampled])
 
-            # 每累積 CHUNK_SAMPLES 就送出一次
-            while len(self._buf) >= CHUNK_SAMPLES:
-                chunk = self._buf[:CHUNK_SAMPLES].copy()
-                self._buf = self._buf[CHUNK_SAMPLES:]
-                if self._callback:
-                    self._callback(chunk)
+                # 每累積 CHUNK_SAMPLES 就送出一次
+                while len(self._buf) >= CHUNK_SAMPLES:
+                    chunk = self._buf[:CHUNK_SAMPLES].copy()
+                    self._buf = self._buf[CHUNK_SAMPLES:]
+                    if self._callback:
+                        self._callback(chunk)
+            except Exception as e:
+                print(f"[Consumer error] {e}", flush=True)
+                import traceback; traceback.print_exc()
 
     def stop(self) -> None:
         self._running = False
@@ -828,8 +852,7 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
             try:
                 result = asr.transcribe(audio)
                 language = result.get("language", "")
-                text = result.get("text", "")
-                text = _to_traditional(text, language)
+                text = _to_traditional(result.get("text", ""), language)
 
                 if text and text != current_original:
                     current_original = text
