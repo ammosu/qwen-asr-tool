@@ -688,8 +688,12 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
         return "", raw.strip()
 
     def _to_traditional(text: str, language: str) -> str:
-        """若語言為中文，將簡體轉成台灣繁體。"""
-        if language and "chinese" in language.lower():
+        """若語言為中文（語言標籤或文字內含 CJK），將簡體轉成台灣繁體。"""
+        is_chinese = (
+            (language and any(kw in language.lower() for kw in ("chinese", "mandarin", "cantonese")))
+            or any("\u4e00" <= c <= "\u9fff" for c in text)
+        )
+        if is_chinese:
             return _s2tw.convert(text)
         return text
 
