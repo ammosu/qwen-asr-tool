@@ -618,20 +618,16 @@ def _worker_main(text_q: multiprocessing.SimpleQueue, cmd_q: multiprocessing.Sim
                         buf.append(chunk)
                         sil_cnt += 1
                         if sil_cnt >= RT_SILENCE_CHUNKS:
-                            # 靜音 0.8s：送出整段語音
+                            # 靜音 0.8s：送出整段語音，保留 h/c 以免下句開頭被漏偵測
                             _speech_q.put(np.concatenate(buf))
                             buf = []
                             sil_cnt = 0
-                            h = np.zeros((1, 1, 128), dtype=np.float32)
-                            c = np.zeros((1, 1, 128), dtype=np.float32)
 
-                    # Max buffer 10s：強制送出
+                    # Max buffer 10s：強制送出，保留 h/c
                     if len(buf) >= RT_MAX_BUFFER_CHUNKS:
                         _speech_q.put(np.concatenate(buf))
                         buf = []
                         sil_cnt = 0
-                        h = np.zeros((1, 1, 128), dtype=np.float32)
-                        c = np.zeros((1, 1, 128), dtype=np.float32)
 
         except Exception as e:
             print(f"[VAD fatal error] {e}", flush=True)
