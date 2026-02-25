@@ -389,6 +389,7 @@ class MonitorAudioSource(AudioSource):
         # Windows: 輸出裝置名稱或索引（None → 自動偵測預設輸出）
         self._device = device if sys.platform == "win32" else (device or self.DEFAULT_DEVICE)
         self._stream = None
+        self._pa = None          # pyaudiowpatch instance (Windows only)
         self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
         self._native_sr: int = 0
         self._callback: Callable[[np.ndarray], None] | None = None
@@ -431,43 +432,60 @@ class MonitorAudioSource(AudioSource):
         )
 
     def _setup_windows(self, sd) -> None:
-        """Windows：透過 WASAPI Loopback 擷取系統播放音訊。"""
-        # 找 WASAPI host API 索引
-        wasapi_idx = next(
-            (i for i, api in enumerate(sd.query_hostapis()) if "wasapi" in api["name"].lower()),
-            None,
-        )
-        if wasapi_idx is None:
-            raise RuntimeError("找不到 WASAPI host API，請確認 Windows 音訊驅動正常")
+        """Windows：透過 pyaudiowpatch WASAPI Loopback 擷取系統播放音訊。"""
+        import pyaudiowpatch as pyaudio
+
+        self._pa = pyaudio.PyAudio()
+        wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
 
         if self._device is not None:
-            # 使用者指定裝置名稱或索引
-            output_dev = self._device
-            dev_info = sd.query_devices(output_dev)
+            loopback_idx = int(self._device)
+            dev_info = self._pa.get_device_info_by_index(loopback_idx)
         else:
-            # 自動偵測：找預設輸出裝置對應的 WASAPI 裝置
-            default_out_name = sd.query_devices(kind="output")["name"]
-            output_dev = next(
-                (i for i, d in enumerate(sd.query_devices())
-                 if d["hostapi"] == wasapi_idx and d["name"] == default_out_name),
-                None,
-            )
-            if output_dev is None:
-                # Fallback：直接使用系統預設輸出索引
-                output_dev = sd.default.device[1]
-            dev_info = sd.query_devices(output_dev)
+            # 自動：找預設輸出裝置對應的 loopback 裝置
+            default_out_idx = wasapi_info["defaultOutputDevice"]
+            default_out = self._pa.get_device_info_by_index(default_out_idx)
+            loopback_idx = None
+            for i in range(self._pa.get_device_count()):
+                dev = self._pa.get_device_info_by_index(i)
+                if dev.get("isLoopbackDevice") and dev["name"].startswith(default_out["name"]):
+                    loopback_idx = i
+                    dev_info = dev
+                    break
+            if loopback_idx is None:
+                raise RuntimeError(
+                    f"找不到 '{default_out['name']}' 的 WASAPI Loopback 裝置"
+                )
 
-        self._native_sr = int(dev_info["default_samplerate"])
-        channels = max(int(dev_info.get("max_output_channels", 0)), 1)
-        self._stream = sd.InputStream(
-            samplerate=self._native_sr,
+        self._native_sr = int(dev_info["defaultSampleRate"])
+        channels = max(int(dev_info["maxInputChannels"]), 1)
+        print(f"[Monitor] WASAPI Loopback: {dev_info['name']}  sr={self._native_sr}  ch={channels}", flush=True)
+
+        def _pa_callback(in_data, frame_count, time_info, status):
+            audio = np.frombuffer(in_data, dtype=np.float32)
+            if channels > 1:
+                audio = audio.reshape(-1, channels)[:, 0]
+            self._queue.put(audio.copy())
+            return (None, pyaudio.paContinue)
+
+        pa_stream = self._pa.open(
+            format=pyaudio.paFloat32,
             channels=channels,
-            dtype="float32",
-            blocksize=int(self._native_sr * 0.05),  # 50ms 固定 buffer
-            device=output_dev,
-            extra_settings=sd.WasapiSettings(loopback=True),
-            callback=self._sd_callback,
+            rate=self._native_sr,
+            input=True,
+            input_device_index=loopback_idx,
+            frames_per_buffer=int(self._native_sr * 0.05),
+            stream_callback=_pa_callback,
         )
+
+        # 包裝成相容 sounddevice 介面的物件
+        class _StreamWrapper:
+            def __init__(self, s): self._s = s
+            def start(self): self._s.start_stream()
+            def stop(self): self._s.stop_stream()
+            def close(self): self._s.close()
+
+        self._stream = _StreamWrapper(pa_stream)
 
     def _sd_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         """音訊執行緒 callback：只做最輕量的 enqueue，不做任何阻塞操作。"""
@@ -501,6 +519,9 @@ class MonitorAudioSource(AudioSource):
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        if self._pa:
+            self._pa.terminate()
+            self._pa = None
         if self._consumer_thread:
             self._consumer_thread.join(timeout=1.0)
             self._consumer_thread = None
