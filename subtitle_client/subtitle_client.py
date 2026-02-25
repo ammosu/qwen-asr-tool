@@ -214,7 +214,10 @@ class SubtitleOverlay:
 
         self._root.overrideredirect(True)
         self._root.wm_attributes("-topmost", True)
-        self._root.wm_attributes("-transparentcolor", self.BG_COLOR)
+        if sys.platform == "win32":
+            self._root.wm_attributes("-transparentcolor", self.BG_COLOR)
+        else:
+            self._root.wm_attributes("-alpha", 0.85)
         self._root.configure(bg=self.BG_COLOR)
         self._root.geometry(
             f"{self.WINDOW_WIDTH}x{self.WINDOW_HEIGHT}+{self._x}+{self._y}"
